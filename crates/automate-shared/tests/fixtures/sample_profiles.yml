@@ -1,0 +1,14 @@
+auth_profiles:
+  default:
+    runtime: claude_code
+    mode: subscription
+
+  bedrock-profile:
+    runtime: claude_code
+    mode: bedrock
+    aws_region: us-east-1
+    aws_model: anthropic.claude-3-sonnet
+
+  api-key-profile:
+    runtime: codex
+    mode: api_key

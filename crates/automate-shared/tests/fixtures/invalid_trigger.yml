@@ -1,0 +1,4 @@
+automations:
+  - name: bad-automation
+    trigger: "foobar(something)"
+    prompt: This should fail to parse

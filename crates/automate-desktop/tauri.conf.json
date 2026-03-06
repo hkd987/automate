@@ -1,0 +1,30 @@
+{
+  "productName": "Automate",
+  "identifier": "com.automate.app",
+  "version": "0.1.0",
+  "build": {
+    "frontendDist": "../../frontend/dist",
+    "devUrl": "http://localhost:5173",
+    "beforeDevCommand": "cd ../../frontend && npm run dev",
+    "beforeBuildCommand": "cd ../../frontend && npm run build"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Automate",
+        "width": 1200,
+        "height": 800,
+        "resizable": true,
+        "fullscreen": false
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "plugins": {
+    "shell": {
+      "open": true
+    }
+  }
+}

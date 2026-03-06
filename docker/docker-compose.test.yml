@@ -1,0 +1,12 @@
+services:
+  test-vm:
+    build:
+      context: .
+      dockerfile: Dockerfile.test-vm
+    ports:
+      - "2222:22"
+    healthcheck:
+      test: ["CMD", "ssh-keyscan", "localhost"]
+      interval: 5s
+      timeout: 3s
+      retries: 5

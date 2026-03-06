@@ -1,0 +1,20 @@
+automations:
+  - name: daily-report
+    trigger: "cron(0 9 * * *)"
+    auth_profile: default
+    prompt: Generate the daily status report
+    file: reports/daily.md
+
+  - name: deploy-webhook
+    trigger: webhook
+    prompt: Run the deployment pipeline
+    auth_profile: bedrock-profile
+
+  - name: error-watcher
+    trigger: "log_pattern(ERROR)"
+    prompt: Analyze the error and suggest a fix
+
+  - name: manual-check
+    trigger: manual
+    prompt: Run a manual health check
+    file: scripts/health.sh

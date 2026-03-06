@@ -1,0 +1,4 @@
+automations:
+  - name: simple
+    trigger: manual
+    prompt: Do something

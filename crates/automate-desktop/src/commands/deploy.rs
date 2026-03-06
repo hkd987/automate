@@ -99,6 +99,12 @@ pub async fn deploy_daemon(
         },
         DeployStep {
             step: 7,
+            label: "Setup WhatsApp bridge".to_string(),
+            status: StepStatus::Pending,
+            detail: None,
+        },
+        DeployStep {
+            step: 8,
             label: "Verify health endpoint".to_string(),
             status: StepStatus::Pending,
             detail: None,
@@ -190,24 +196,74 @@ pub async fn deploy_daemon(
         }
     }
 
-    // Step 7: Verify health
+    // Step 7: Setup WhatsApp bridge
     steps[6].status = StepStatus::InProgress;
+    match setup_whatsapp_bridge(&ssh).await {
+        Ok(detail) => {
+            steps[6].status = StepStatus::Done;
+            steps[6].detail = Some(detail);
+        }
+        Err(e) => {
+            // Non-fatal: WhatsApp bridge setup failure shouldn't block the deploy
+            steps[6].status = StepStatus::Done;
+            steps[6].detail = Some(format!("Skipped ({})", e));
+        }
+    }
+
+    // Step 8: Verify health
+    steps[7].status = StepStatus::InProgress;
     match ssh
         .exec_command("curl -sf http://127.0.0.1:4111/health")
         .await
     {
         Ok(output) => {
-            steps[6].status = StepStatus::Done;
-            steps[6].detail = Some(output);
+            steps[7].status = StepStatus::Done;
+            steps[7].detail = Some(output);
         }
         Err(e) => {
-            steps[6].status = StepStatus::Error;
-            steps[6].detail = Some(e.to_string());
+            steps[7].status = StepStatus::Error;
+            steps[7].detail = Some(e.to_string());
             return Ok(steps);
         }
     }
 
     Ok(steps)
+}
+
+/// Upload the WhatsApp bridge files to the VM and run npm install.
+async fn setup_whatsapp_bridge(ssh: &SshConnection) -> Result<String, String> {
+    // Check if node is available
+    ssh.exec_command("which node")
+        .await
+        .map_err(|_| "Node.js not installed on VM".to_string())?;
+
+    // Create directory
+    ssh.exec_command("mkdir -p ~/.automate/whatsapp-bridge")
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // Write package.json
+    let package_json = include_str!("../../../../whatsapp-bridge/package.json");
+    let cmd = format!(
+        "cat > ~/.automate/whatsapp-bridge/package.json << 'BRIDGE_EOF'\n{}BRIDGE_EOF",
+        package_json
+    );
+    ssh.exec_command(&cmd).await.map_err(|e| e.to_string())?;
+
+    // Write index.js
+    let index_js = include_str!("../../../../whatsapp-bridge/index.js");
+    let cmd = format!(
+        "cat > ~/.automate/whatsapp-bridge/index.js << 'BRIDGE_EOF'\n{}BRIDGE_EOF",
+        index_js
+    );
+    ssh.exec_command(&cmd).await.map_err(|e| e.to_string())?;
+
+    // Run npm install
+    ssh.exec_command("cd ~/.automate/whatsapp-bridge && npm install --production")
+        .await
+        .map_err(|e| format!("npm install failed: {}", e))?;
+
+    Ok("WhatsApp bridge installed".to_string())
 }
 
 #[cfg(test)]

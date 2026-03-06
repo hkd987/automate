@@ -1,17 +1,11 @@
-import { useEffect, useState, useCallback } from 'react'
+import React, { useEffect, useState, useCallback } from 'react'
 import { Badge, Button, Skeleton } from '../components/common'
+import { VmSelector } from '../components/VmSelector'
 import { LogViewer, useLogStream } from '../components/LogViewer'
 import { useTauriCommand } from '../hooks/useTauriCommand'
-import type { RunRecord, RunStatus } from '../types'
-
-function statusVariant(status: RunStatus) {
-  switch (status) {
-    case 'completed': return 'success' as const
-    case 'failed': return 'error' as const
-    case 'running': return 'info' as const
-    case 'pending': return 'neutral' as const
-  }
-}
+import { useSelectedVm } from '../hooks/useSelectedVm'
+import type { RunRecord } from '../types'
+import { statusVariant } from '../utils/status'
 
 function formatDuration(startedAt: string, finishedAt: string | null): string {
   if (!finishedAt) return '--'
@@ -42,13 +36,15 @@ function RunningLogPanel({ runId }: { runId: string }) {
 }
 
 export function RunHistory() {
+  const { vms, selectedVmId, setSelectedVmId, loading: vmLoading } = useSelectedVm()
   const { data: runs, execute: loadRuns, loading } = useTauriCommand<RunRecord[]>('fetch_run_history')
   const [expandedId, setExpandedId] = useState<string | null>(null)
   const [autoRefresh, setAutoRefresh] = useState(false)
 
   const refresh = useCallback(() => {
-    loadRuns().catch(() => {})
-  }, [loadRuns])
+    if (!selectedVmId) return
+    loadRuns({ vm_id: selectedVmId }).catch(() => {})
+  }, [loadRuns, selectedVmId])
 
   useEffect(() => {
     refresh()
@@ -71,6 +67,7 @@ export function RunHistory() {
           <p className="text-gray-400 text-sm mt-1">View past automation runs and their results.</p>
         </div>
         <div className="flex items-center gap-4">
+          <VmSelector vms={vms} selectedVmId={selectedVmId} onSelect={setSelectedVmId} loading={vmLoading} />
           <label className="text-sm text-gray-300 flex items-center gap-2 cursor-pointer">
             <input
               type="checkbox"
@@ -124,9 +121,8 @@ export function RunHistory() {
             </thead>
             <tbody className="text-gray-200">
               {runList.map((run) => (
-                <>
+                <React.Fragment key={run.id}>
                   <tr
-                    key={run.id}
                     className="border-b border-gray-800 hover:bg-gray-800/50 cursor-pointer"
                     onClick={() => setExpandedId(expandedId === run.id ? null : run.id)}
                   >
@@ -176,7 +172,7 @@ export function RunHistory() {
                       </td>
                     </tr>
                   )}
-                </>
+                </React.Fragment>
               ))}
             </tbody>
           </table>

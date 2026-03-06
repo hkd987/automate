@@ -2,6 +2,9 @@ use automate_shared::auth::AuthProfileDef;
 use automate_shared::config::ProfilesConfig;
 use std::collections::HashMap;
 
+use crate::daemon_client::DaemonClient;
+use crate::state::AppState;
+
 fn profiles_path() -> std::path::PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
     std::path::Path::new(&home)
@@ -56,24 +59,25 @@ pub async fn delete_auth_profile(name: String) -> Result<(), String> {
 
 #[tauri::command]
 pub async fn push_credentials(
-    _daemon_url: String,
-    _key: String,
-    _value: String,
+    state: tauri::State<'_, AppState>,
+    vm_id: String,
+    key: String,
+    value: String,
 ) -> Result<(), String> {
-    // Placeholder: In production this would push credentials to the daemon
-    // via an SSH tunnel. For now we just validate the inputs.
-    if _key.is_empty() {
+    if key.is_empty() {
         return Err("Credential key cannot be empty".to_string());
     }
-    if _value.is_empty() {
+    if value.is_empty() {
         return Err("Credential value cannot be empty".to_string());
     }
-    // TODO: POST to daemon_url/credentials once SSH tunnel is wired up
-    Ok(())
+    let client = DaemonClient::from_vm(&state, &vm_id).await?;
+    client.push_credential(&key, &value).await
 }
 
 #[tauri::command]
 pub async fn configure_slack(
+    state: tauri::State<'_, AppState>,
+    vm_id: String,
     bot_token: String,
     app_token: String,
     allowed_user_ids: Vec<String>,
@@ -85,16 +89,31 @@ pub async fn configure_slack(
     if enabled && app_token.is_empty() {
         return Err("App token is required for socket mode".to_string());
     }
-    // TODO: Push config to daemon via API
-    let _ = (bot_token, app_token, allowed_user_ids, enabled);
-    Ok(())
+    let client = DaemonClient::from_vm(&state, &vm_id).await?;
+    let config = serde_json::json!({
+        "channel_type": "slack",
+        "enabled": enabled,
+        "bot_token": bot_token,
+        "app_token": app_token,
+        "allowed_user_ids": allowed_user_ids,
+    });
+    client.configure_channel(&config.to_string()).await
 }
 
 #[tauri::command]
-pub async fn configure_whatsapp(allowed_numbers: Vec<String>, enabled: bool) -> Result<(), String> {
-    // TODO: Push config to daemon via API
-    let _ = (allowed_numbers, enabled);
-    Ok(())
+pub async fn configure_whatsapp(
+    state: tauri::State<'_, AppState>,
+    vm_id: String,
+    allowed_numbers: Vec<String>,
+    enabled: bool,
+) -> Result<(), String> {
+    let client = DaemonClient::from_vm(&state, &vm_id).await?;
+    let config = serde_json::json!({
+        "channel_type": "whatsapp",
+        "enabled": enabled,
+        "allowed_numbers": allowed_numbers,
+    });
+    client.configure_channel(&config.to_string()).await
 }
 
 #[cfg(test)]

@@ -173,6 +173,12 @@ fn find_config_file(path: &Path) -> Option<PathBuf> {
     None
 }
 
+enum ConfigChange {
+    Removed(String),
+    Updated(String, automate_shared::config::AutomationDef),
+    Added(String, automate_shared::config::AutomationDef),
+}
+
 async fn reload_config(
     config_path: &Path,
     db: &Arc<Mutex<Connection>>,
@@ -182,41 +188,60 @@ async fn reload_config(
     let content = std::fs::read_to_string(config_path)?;
     let new_config: AutomateConfig = serde_yaml::from_str(&content)?;
 
-    let conn = db.lock().await;
+    // Compute diff and apply DB changes while holding the lock
+    let changes = {
+        let conn = db.lock().await;
 
-    // Load current automations from DB
-    let current = db::list_automations(&conn)?;
-    let current_map: HashMap<String, _> =
-        current.into_iter().map(|a| (a.name.clone(), a)).collect();
+        let current = db::list_automations(&conn)?;
+        let current_map: HashMap<String, _> =
+            current.into_iter().map(|a| (a.name.clone(), a)).collect();
 
-    let new_map: HashMap<String, _> = new_config
-        .automations
-        .iter()
-        .map(|a| (a.name.clone(), a.clone()))
-        .collect();
+        let new_map: HashMap<String, _> = new_config
+            .automations
+            .iter()
+            .map(|a| (a.name.clone(), a.clone()))
+            .collect();
 
-    // Find removed automations
-    for name in current_map.keys() {
-        if !new_map.contains_key(name) {
-            db::delete_automation(&conn, name)?;
-            let _ = scheduler.remove_cron(name).await;
-            info!(automation = %name, "Removed automation via config reload");
-        }
-    }
+        let mut changes = Vec::new();
 
-    // Find added or changed automations
-    for (name, new_def) in &new_map {
-        match current_map.get(name) {
-            Some(existing) if existing == new_def => {
-                // No change
-            }
-            Some(_) => {
-                // Changed: delete and re-insert
+        // Find removed automations
+        for name in current_map.keys() {
+            if !new_map.contains_key(name) {
                 db::delete_automation(&conn, name)?;
-                db::insert_automation(&conn, new_def)?;
+                changes.push(ConfigChange::Removed(name.clone()));
+            }
+        }
 
-                // Update scheduler
-                let _ = scheduler.remove_cron(name).await;
+        // Find added or changed automations
+        for (name, new_def) in &new_map {
+            match current_map.get(name) {
+                Some(existing) if existing == new_def => {
+                    // No change
+                }
+                Some(_) => {
+                    db::delete_automation(&conn, name)?;
+                    db::insert_automation(&conn, new_def)?;
+                    changes.push(ConfigChange::Updated(name.clone(), new_def.clone()));
+                }
+                None => {
+                    db::insert_automation(&conn, new_def)?;
+                    changes.push(ConfigChange::Added(name.clone(), new_def.clone()));
+                }
+            }
+        }
+
+        changes
+    }; // DB lock dropped here
+
+    // Apply scheduler changes without holding the DB lock
+    for change in changes {
+        match change {
+            ConfigChange::Removed(name) => {
+                let _ = scheduler.remove_cron(&name).await;
+                info!(automation = %name, "Removed automation via config reload");
+            }
+            ConfigChange::Updated(name, new_def) => {
+                let _ = scheduler.remove_cron(&name).await;
                 if let TriggerDef::Cron(ref expr) = new_def.trigger {
                     if let Err(e) = scheduler
                         .register_cron(name.clone(), expr, new_def.prompt.clone(), job_tx.clone())
@@ -227,9 +252,7 @@ async fn reload_config(
                 }
                 info!(automation = %name, "Updated automation via config reload");
             }
-            None => {
-                // New automation
-                db::insert_automation(&conn, new_def)?;
+            ConfigChange::Added(name, new_def) => {
                 if let TriggerDef::Cron(ref expr) = new_def.trigger {
                     if let Err(e) = scheduler
                         .register_cron(name.clone(), expr, new_def.prompt.clone(), job_tx.clone())

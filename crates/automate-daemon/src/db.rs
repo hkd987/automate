@@ -40,8 +40,11 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         );
         CREATE TABLE IF NOT EXISTS credentials (
             key TEXT PRIMARY KEY,
-            encrypted_value BLOB NOT NULL
-        );",
+            encrypted_value BLOB NOT NULL,
+            nonce BLOB
+        );
+        CREATE INDEX IF NOT EXISTS idx_runs_started ON runs(started_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_runs_automation ON runs(automation_name);",
     )?;
     Ok(())
 }
@@ -171,10 +174,15 @@ pub fn update_run(conn: &Connection, run: &RunRecord) -> Result<()> {
     Ok(())
 }
 
-pub fn list_runs(conn: &Connection) -> Result<Vec<RunRecord>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, automation_name, status, trigger_source, started_at, finished_at, output, error FROM runs ORDER BY started_at DESC",
-    )?;
+pub fn list_runs(conn: &Connection, limit: Option<u32>) -> Result<Vec<RunRecord>> {
+    let query = match limit {
+        Some(n) => format!(
+            "SELECT id, automation_name, status, trigger_source, started_at, finished_at, output, error FROM runs ORDER BY started_at DESC LIMIT {}",
+            n
+        ),
+        None => "SELECT id, automation_name, status, trigger_source, started_at, finished_at, output, error FROM runs ORDER BY started_at DESC".to_string(),
+    };
+    let mut stmt = conn.prepare(&query)?;
     let rows = stmt.query_map([], |row| {
         Ok((
             row.get::<_, String>(0)?,
@@ -326,7 +334,7 @@ mod tests {
         let run = make_run("test-auto");
         insert_run(&conn, &run).unwrap();
 
-        let runs = list_runs(&conn).unwrap();
+        let runs = list_runs(&conn, None).unwrap();
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].automation_name, "test-auto");
         assert_eq!(runs[0].status, RunStatus::Pending);
@@ -343,7 +351,7 @@ mod tests {
         run.output = Some("all done".to_string());
         update_run(&conn, &run).unwrap();
 
-        let runs = list_runs(&conn).unwrap();
+        let runs = list_runs(&conn, None).unwrap();
         assert_eq!(runs[0].status, RunStatus::Completed);
         assert!(runs[0].finished_at.is_some());
         assert_eq!(runs[0].output, Some("all done".to_string()));
@@ -357,7 +365,7 @@ mod tests {
         run.error = Some("something broke".to_string());
         insert_run(&conn, &run).unwrap();
 
-        let runs = list_runs(&conn).unwrap();
+        let runs = list_runs(&conn, None).unwrap();
         assert_eq!(runs[0].status, RunStatus::Failed);
         assert_eq!(runs[0].error, Some("something broke".to_string()));
     }

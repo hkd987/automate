@@ -23,11 +23,8 @@ export interface RunRecord {
   error: string | null
 }
 
-export type TriggerDef =
-  | { type: 'cron'; expression: string }
-  | { type: 'webhook' }
-  | { type: 'log_pattern'; pattern: string }
-  | { type: 'manual' }
+// TriggerDef comes as a string from the backend (e.g., "cron(0 9 * * *)", "webhook", "manual")
+export type TriggerDef = string
 
 export interface AutomationDef {
   name: string

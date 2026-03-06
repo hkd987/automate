@@ -19,6 +19,7 @@ interface FormErrors {
   name?: string
   prompt?: string
   cronExpression?: string
+  vms?: string
 }
 
 const emptyForm: FormState = {
@@ -134,18 +135,18 @@ export function AutomationBuilder() {
 
     const automation: AutomationDef = {
       name: form.name,
-      trigger: formToTriggerString(form) as unknown as AutomationDef['trigger'],
+      trigger: formToTriggerString(form),
       auth_profile: form.authProfile || null,
       prompt: form.prompt,
       file: null,
     }
     try {
-      if (selectedVmIds.length > 0) {
-        for (const vmId of selectedVmIds) {
-          await deployAutomation({ automation, vm_id: vmId })
-        }
-      } else {
-        await deployAutomation({ automation })
+      if (selectedVmIds.length === 0) {
+        setFormErrors((e) => ({ ...e, vms: 'Select at least one target VM' }))
+        return
+      }
+      for (const vmId of selectedVmIds) {
+        await deployAutomation({ automation, vm_id: vmId })
       }
       setSuccess(true)
     } catch {
@@ -246,6 +247,7 @@ export function AutomationBuilder() {
                           ? [...ids, vm.id]
                           : ids.filter((id) => id !== vm.id)
                       )
+                      setFormErrors((err) => ({ ...err, vms: undefined }))
                     }}
                     className="rounded bg-gray-800 border-gray-600"
                   />
@@ -253,8 +255,8 @@ export function AutomationBuilder() {
                 </label>
               ))}
             </div>
-            {selectedVmIds.length === 0 && (
-              <p className="text-xs text-gray-500">No VMs selected - will deploy to default target.</p>
+            {formErrors.vms && (
+              <p className="text-red-400 text-xs mt-1">{formErrors.vms}</p>
             )}
           </div>
         )}

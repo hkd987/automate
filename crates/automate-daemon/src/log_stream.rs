@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
@@ -6,6 +7,7 @@ use serde::Serialize;
 use tokio::sync::{broadcast, RwLock};
 
 const BROADCAST_CAPACITY: usize = 1024;
+const MAX_HISTORY_LINES: usize = 10_000;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct LogLine {
@@ -16,7 +18,7 @@ pub struct LogLine {
 
 pub struct RunLogBroadcaster {
     sender: broadcast::Sender<LogLine>,
-    history: Arc<RwLock<Vec<LogLine>>>,
+    history: Arc<RwLock<VecDeque<LogLine>>>,
 }
 
 impl RunLogBroadcaster {
@@ -24,17 +26,17 @@ impl RunLogBroadcaster {
         let (sender, _) = broadcast::channel(BROADCAST_CAPACITY);
         Self {
             sender,
-            history: Arc::new(RwLock::new(Vec::new())),
+            history: Arc::new(RwLock::new(VecDeque::new())),
         }
     }
 
-    pub fn send(&self, line: LogLine) {
+    pub async fn send(&self, line: LogLine) {
         {
-            let history = self.history.clone();
-            let line_clone = line.clone();
-            tokio::spawn(async move {
-                history.write().await.push(line_clone);
-            });
+            let mut history = self.history.write().await;
+            history.push_back(line.clone());
+            while history.len() > MAX_HISTORY_LINES {
+                history.pop_front();
+            }
         }
         // Ignore send error (no active receivers)
         let _ = self.sender.send(line);
@@ -45,7 +47,7 @@ impl RunLogBroadcaster {
     }
 
     pub async fn get_history(&self) -> Vec<LogLine> {
-        self.history.read().await.clone()
+        self.history.read().await.iter().cloned().collect()
     }
 }
 
@@ -118,7 +120,7 @@ mod tests {
             stream: "stdout",
             content: "hello world".to_string(),
         };
-        broadcaster.send(line.clone());
+        broadcaster.send(line.clone()).await;
 
         let received = rx.recv().await.unwrap();
         assert_eq!(received.content, "hello world");
@@ -132,11 +134,13 @@ mod tests {
         let mut rx1 = broadcaster.subscribe();
         let mut rx2 = broadcaster.subscribe();
 
-        broadcaster.send(LogLine {
-            timestamp: Utc::now(),
-            stream: "stdout",
-            content: "line 1".to_string(),
-        });
+        broadcaster
+            .send(LogLine {
+                timestamp: Utc::now(),
+                stream: "stdout",
+                content: "line 1".to_string(),
+            })
+            .await;
 
         let r1 = rx1.recv().await.unwrap();
         let r2 = rx2.recv().await.unwrap();
@@ -149,14 +153,13 @@ mod tests {
         let mgr = LogStreamManager::new();
         let broadcaster = mgr.create_stream("run-3").await;
 
-        broadcaster.send(LogLine {
-            timestamp: Utc::now(),
-            stream: "stdout",
-            content: "early line".to_string(),
-        });
-
-        // Allow the spawn to complete
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        broadcaster
+            .send(LogLine {
+                timestamp: Utc::now(),
+                stream: "stdout",
+                content: "early line".to_string(),
+            })
+            .await;
 
         let (history, _rx) = mgr.subscribe("run-3").await.unwrap();
         assert_eq!(history.len(), 1);
@@ -186,19 +189,20 @@ mod tests {
         let mgr = LogStreamManager::new();
         let broadcaster = mgr.create_stream("run-5").await;
 
-        broadcaster.send(LogLine {
-            timestamp: Utc::now(),
-            stream: "stdout",
-            content: "line 1".to_string(),
-        });
-        broadcaster.send(LogLine {
-            timestamp: Utc::now(),
-            stream: "stderr",
-            content: "err 1".to_string(),
-        });
-
-        // Allow spawns to complete
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        broadcaster
+            .send(LogLine {
+                timestamp: Utc::now(),
+                stream: "stdout",
+                content: "line 1".to_string(),
+            })
+            .await;
+        broadcaster
+            .send(LogLine {
+                timestamp: Utc::now(),
+                stream: "stderr",
+                content: "err 1".to_string(),
+            })
+            .await;
 
         let history = mgr.get_history("run-5").await;
         assert_eq!(history.len(), 2);

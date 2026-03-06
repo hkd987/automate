@@ -1,20 +1,34 @@
 use automate_shared::config::AutomationDef;
 
+use crate::daemon_client::DaemonClient;
+use crate::state::AppState;
+
 #[tauri::command]
-pub async fn deploy_automation(automation: AutomationDef) -> Result<AutomationDef, String> {
-    // Placeholder: In a full implementation, this would push the automation config
-    // to the daemon via HTTP through an SSH tunnel.
+pub async fn deploy_automation(
+    state: tauri::State<'_, AppState>,
+    automation: AutomationDef,
+    vm_id: String,
+) -> Result<AutomationDef, String> {
+    let client = DaemonClient::from_vm(&state, &vm_id).await?;
+    client.create_automation(&automation).await?;
     Ok(automation)
 }
 
 #[tauri::command]
-pub async fn list_remote_automations() -> Result<Vec<AutomationDef>, String> {
-    // Placeholder: Would fetch from daemon via SSH tunnel
-    Ok(vec![])
+pub async fn list_remote_automations(
+    state: tauri::State<'_, AppState>,
+    vm_id: String,
+) -> Result<Vec<AutomationDef>, String> {
+    let client = DaemonClient::from_vm(&state, &vm_id).await?;
+    client.list_automations().await
 }
 
 #[tauri::command]
-pub async fn trigger_remote_run(name: String) -> Result<String, String> {
-    // Placeholder: Would POST to daemon's run endpoint via SSH tunnel
-    Ok(format!("Run triggered for '{}' (placeholder)", name))
+pub async fn trigger_remote_run(
+    state: tauri::State<'_, AppState>,
+    vm_id: String,
+    name: String,
+) -> Result<String, String> {
+    let client = DaemonClient::from_vm(&state, &vm_id).await?;
+    client.trigger_run(&name).await
 }

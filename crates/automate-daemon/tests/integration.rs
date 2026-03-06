@@ -55,6 +55,7 @@ fn setup_test_app(
         start_time: Instant::now(),
         version: "0.1.0-test".to_string(),
         github_repo: "lumatthews/automate".to_string(),
+        whatsapp_qr: Arc::new(tokio::sync::Mutex::new(None)),
     };
 
     let app = automate_daemon::api::create_router(state);

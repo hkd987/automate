@@ -1,17 +1,11 @@
 import { useEffect } from 'react'
 import { Badge, Button, Skeleton } from '../components/common'
+import { VmSelector } from '../components/VmSelector'
 import { useTauriCommand } from '../hooks/useTauriCommand'
-import type { AutomationDef, RunRecord, RunStatus } from '../types'
+import { useSelectedVm } from '../hooks/useSelectedVm'
+import type { AutomationDef, RunRecord } from '../types'
+import { statusVariant } from '../utils/status'
 import { Link } from 'react-router-dom'
-
-function statusVariant(status: RunStatus) {
-  switch (status) {
-    case 'completed': return 'success' as const
-    case 'failed': return 'error' as const
-    case 'running': return 'info' as const
-    case 'pending': return 'neutral' as const
-  }
-}
 
 function triggerLabel(trigger: string): string {
   if (trigger.startsWith('cron(')) return 'Cron'
@@ -22,19 +16,22 @@ function triggerLabel(trigger: string): string {
 }
 
 export function Dashboard() {
+  const { vms, selectedVmId, setSelectedVmId, loading: vmLoading } = useSelectedVm()
   const { data: automations, execute: loadAutomations, loading: loadingAutos } = useTauriCommand<AutomationDef[]>('list_remote_automations')
   const { data: runs, execute: loadRuns, loading: loadingRuns } = useTauriCommand<RunRecord[]>('fetch_run_history')
   const { execute: triggerRun, loading: triggering } = useTauriCommand<string>('trigger_remote_run')
 
   useEffect(() => {
-    loadAutomations().catch(() => {})
-    loadRuns().catch(() => {})
-  }, [loadAutomations, loadRuns])
+    if (!selectedVmId) return
+    loadAutomations({ vm_id: selectedVmId }).catch(() => {})
+    loadRuns({ vm_id: selectedVmId }).catch(() => {})
+  }, [loadAutomations, loadRuns, selectedVmId])
 
   const handleRunNow = async (name: string) => {
+    if (!selectedVmId) return
     try {
-      await triggerRun({ name })
-      await loadRuns()
+      await triggerRun({ name, vm_id: selectedVmId })
+      await loadRuns({ vm_id: selectedVmId })
     } catch {
       // error in hook
     }
@@ -47,7 +44,14 @@ export function Dashboard() {
 
   return (
     <div>
-      <h1 className="text-2xl font-bold mb-6">Dashboard</h1>
+      <div className="flex items-center justify-between mb-6">
+        <h1 className="text-2xl font-bold">Dashboard</h1>
+        <VmSelector vms={vms} selectedVmId={selectedVmId} onSelect={setSelectedVmId} loading={vmLoading} />
+      </div>
+
+      {!selectedVmId && !vmLoading && vms.length === 0 && (
+        <p className="text-gray-500 text-sm mb-6">No VMs configured. <Link to="/vms" className="text-blue-400 hover:underline">Add a VM</Link> to get started.</p>
+      )}
 
       <section className="mb-8">
         <h2 className="text-lg font-semibold mb-3 text-gray-300">Automations</h2>
@@ -94,7 +98,7 @@ export function Dashboard() {
                   <tr key={auto.name} className="border-b border-gray-800 hover:bg-gray-800/50">
                     <td className="py-3 font-medium">{auto.name}</td>
                     <td className="py-3">
-                      <Badge variant="info">{typeof auto.trigger === 'string' ? triggerLabel(auto.trigger) : auto.trigger.type ?? 'unknown'}</Badge>
+                      <Badge variant="info">{triggerLabel(auto.trigger)}</Badge>
                     </td>
                     <td className="py-3 text-gray-400">{auto.auth_profile ?? 'none'}</td>
                     <td className="py-3 text-right">

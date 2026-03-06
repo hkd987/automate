@@ -73,32 +73,34 @@ pub fn delete_vm(conn: &Connection, id: &Uuid) -> Result<()> {
     Ok(())
 }
 
+fn row_to_vm_profile(row: &rusqlite::Row) -> rusqlite::Result<VmProfile> {
+    Ok(VmProfile {
+        id: row
+            .get::<_, String>(0)?
+            .parse()
+            .unwrap_or_else(|_| Uuid::nil()),
+        name: row.get(1)?,
+        host: row.get(2)?,
+        port: row.get::<_, i64>(3)? as u16,
+        user: row.get(4)?,
+        key_path: row.get(5)?,
+        arch: row.get(6)?,
+        created_at: row
+            .get::<_, String>(7)?
+            .parse()
+            .unwrap_or_else(|_| Utc::now()),
+        updated_at: row
+            .get::<_, String>(8)?
+            .parse()
+            .unwrap_or_else(|_| Utc::now()),
+    })
+}
+
 pub fn list_vms(conn: &Connection) -> Result<Vec<VmProfile>> {
     let mut stmt = conn.prepare(
         "SELECT id, name, host, port, user, key_path, arch, created_at, updated_at FROM vm_profiles ORDER BY created_at DESC",
     )?;
-    let rows = stmt.query_map([], |row| {
-        Ok(VmProfile {
-            id: row
-                .get::<_, String>(0)?
-                .parse()
-                .unwrap_or_else(|_| Uuid::nil()),
-            name: row.get(1)?,
-            host: row.get(2)?,
-            port: row.get::<_, i64>(3)? as u16,
-            user: row.get(4)?,
-            key_path: row.get(5)?,
-            arch: row.get(6)?,
-            created_at: row
-                .get::<_, String>(7)?
-                .parse()
-                .unwrap_or_else(|_| Utc::now()),
-            updated_at: row
-                .get::<_, String>(8)?
-                .parse()
-                .unwrap_or_else(|_| Utc::now()),
-        })
-    })?;
+    let rows = stmt.query_map([], row_to_vm_profile)?;
     let mut vms = Vec::new();
     for row in rows {
         vms.push(row?);
@@ -110,28 +112,7 @@ pub fn get_vm(conn: &Connection, id: &Uuid) -> Result<Option<VmProfile>> {
     let mut stmt = conn.prepare(
         "SELECT id, name, host, port, user, key_path, arch, created_at, updated_at FROM vm_profiles WHERE id=?1",
     )?;
-    let mut rows = stmt.query_map(params![id.to_string()], |row| {
-        Ok(VmProfile {
-            id: row
-                .get::<_, String>(0)?
-                .parse()
-                .unwrap_or_else(|_| Uuid::nil()),
-            name: row.get(1)?,
-            host: row.get(2)?,
-            port: row.get::<_, i64>(3)? as u16,
-            user: row.get(4)?,
-            key_path: row.get(5)?,
-            arch: row.get(6)?,
-            created_at: row
-                .get::<_, String>(7)?
-                .parse()
-                .unwrap_or_else(|_| Utc::now()),
-            updated_at: row
-                .get::<_, String>(8)?
-                .parse()
-                .unwrap_or_else(|_| Utc::now()),
-        })
-    })?;
+    let mut rows = stmt.query_map(params![id.to_string()], row_to_vm_profile)?;
     match rows.next() {
         Some(row) => Ok(Some(row?)),
         None => Ok(None),

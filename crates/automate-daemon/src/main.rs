@@ -79,7 +79,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Default to ClaudeCode runtime
     let runtime: Arc<dyn agent::AgentRuntime> =
-        Arc::new(agent::claude_code::ClaudeCodeRuntime::new());
+        Arc::new(agent::claude_code::ClaudeCodeRuntime::create());
 
     // Initialize log stream manager for real-time log streaming
     let log_stream_mgr = Arc::new(log_stream::LogStreamManager::new());
@@ -97,13 +97,17 @@ async fn main() -> anyhow::Result<()> {
         .await;
     });
 
+    // Load all automations once from DB for startup initialization
+    let automations = {
+        let conn = db.lock().await;
+        db::list_automations(&conn)?
+    };
+
     // Initialize scheduler and restore cron jobs
     let sched = scheduler::Scheduler::new().await?;
     {
-        let conn = db.lock().await;
-        let automations = db::list_automations(&conn)?;
         let cron_jobs: Vec<(String, String, String)> = automations
-            .into_iter()
+            .iter()
             .filter_map(|a| {
                 if let TriggerDef::Cron(expr) = &a.trigger {
                     Some((a.name.clone(), expr.clone(), a.prompt.clone()))
@@ -119,40 +123,37 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Initialize webhook state from DB
-    let webhook_secrets = Arc::new(Mutex::new(HashMap::new()));
-    let webhook_prompts = Arc::new(Mutex::new(HashMap::new()));
-    {
+    let webhook_entries = {
         let conn = db.lock().await;
-        let automations = db::list_automations(&conn)?;
-        for a in automations {
+        let mut entries = HashMap::new();
+        for a in &automations {
             if a.trigger == TriggerDef::Webhook {
-                // Use webhook secret from credentials if available
                 if let Ok(Some(secret)) = automate_daemon::credentials::get_credential(
                     &conn,
                     &format!("{}.webhook_secret", a.name),
                 ) {
-                    webhook_secrets.lock().await.insert(a.name.clone(), secret);
-                    webhook_prompts
-                        .lock()
-                        .await
-                        .insert(a.name.clone(), a.prompt.clone());
+                    entries.insert(
+                        a.name.clone(),
+                        webhook::WebhookEntry {
+                            secret,
+                            prompt: a.prompt.clone(),
+                        },
+                    );
                 }
             }
         }
-    }
+        entries
+    };
 
     let webhook_state = webhook::WebhookState {
-        secrets: webhook_secrets,
-        prompts: webhook_prompts,
+        entries: Arc::new(Mutex::new(webhook_entries)),
         job_tx: job_tx.clone(),
     };
 
     // Initialize log watcher manager
     let log_watcher_mgr = Arc::new(log_watcher::LogWatcherManager::new());
     {
-        let conn = db.lock().await;
-        let automations = db::list_automations(&conn)?;
-        for a in automations {
+        for a in &automations {
             if let TriggerDef::LogPattern(pattern) = &a.trigger {
                 // Log watchers need a file path
                 if let Some(file) = &a.file {
@@ -212,6 +213,7 @@ async fn main() -> anyhow::Result<()> {
         start_time: Instant::now(),
         version: VERSION.to_string(),
         github_repo: GITHUB_REPO.to_string(),
+        whatsapp_qr: Arc::new(Mutex::new(None)),
     };
 
     let ws_state = log_stream_ws::WsState { log_stream_mgr };

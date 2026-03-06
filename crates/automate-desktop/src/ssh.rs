@@ -159,7 +159,8 @@ impl SshConnection {
 
         drop(guard);
 
-        let cmd = format!("cat > {}", remote_path);
+        let escaped = remote_path.replace("'", "'\\''");
+        let cmd = format!("cat > '{}'", escaped);
         channel
             .exec(true, cmd.as_str())
             .await

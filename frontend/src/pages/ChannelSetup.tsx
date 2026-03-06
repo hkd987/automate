@@ -1,15 +1,22 @@
-import { useState } from 'react'
-import { Button, Input } from '../components/common'
+import { useState, useEffect, useRef } from 'react'
+import { QRCodeSVG } from 'qrcode.react'
+import { Button, Input, Toggle } from '../components/common'
+import { VmSelector } from '../components/VmSelector'
 import { useTauriCommand } from '../hooks/useTauriCommand'
+import { useSelectedVm } from '../hooks/useSelectedVm'
 
 type Tab = 'slack' | 'whatsapp'
 
 export function ChannelSetup() {
   const [activeTab, setActiveTab] = useState<Tab>('slack')
+  const { vms, selectedVmId, setSelectedVmId, loading: vmLoading } = useSelectedVm()
 
   return (
     <div>
-      <h1 className="text-2xl font-bold mb-6">Channels</h1>
+      <div className="flex items-center justify-between mb-6">
+        <h1 className="text-2xl font-bold">Channels</h1>
+        <VmSelector vms={vms} selectedVmId={selectedVmId} onSelect={setSelectedVmId} loading={vmLoading} />
+      </div>
 
       <div className="flex gap-2 mb-6 border-b border-gray-700 pb-2">
         <button
@@ -34,12 +41,12 @@ export function ChannelSetup() {
         </button>
       </div>
 
-      {activeTab === 'slack' ? <SlackConfig /> : <WhatsAppConfig />}
+      {activeTab === 'slack' ? <SlackConfig vmId={selectedVmId} /> : <WhatsAppConfig vmId={selectedVmId} />}
     </div>
   )
 }
 
-function SlackConfig() {
+function SlackConfig({ vmId }: { vmId: string | null }) {
   const [botToken, setBotToken] = useState('')
   const [appToken, setAppToken] = useState('')
   const [allowedUsers, setAllowedUsers] = useState('')
@@ -61,6 +68,7 @@ function SlackConfig() {
         appToken,
         allowedUserIds: userIds,
         enabled,
+        vm_id: vmId,
       })
       setSuccess(true)
     } catch {
@@ -106,21 +114,7 @@ function SlackConfig() {
         onChange={e => setAllowedUsers(e.target.value)}
       />
 
-      <div className="flex items-center gap-3">
-        <label className="text-sm text-gray-300">Enabled</label>
-        <button
-          onClick={() => setEnabled(!enabled)}
-          className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
-            enabled ? 'bg-blue-600' : 'bg-gray-600'
-          }`}
-        >
-          <span
-            className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
-              enabled ? 'translate-x-6' : 'translate-x-1'
-            }`}
-          />
-        </button>
-      </div>
+      <Toggle label="Enabled" checked={enabled} onChange={setEnabled} />
 
       {error && <p className="text-red-400 text-sm">{error}</p>}
       {success && <p className="text-green-400 text-sm">Slack configuration saved.</p>}
@@ -137,12 +131,59 @@ function SlackConfig() {
   )
 }
 
-function WhatsAppConfig() {
+type WhatsAppStatus = 'idle' | 'waiting_qr' | 'connected' | 'disconnected'
+
+function WhatsAppConfig({ vmId }: { vmId: string | null }) {
   const [allowedNumbers, setAllowedNumbers] = useState('')
   const [enabled, setEnabled] = useState(false)
+  const [qrCode, setQrCode] = useState<string | null>(null)
+  const [status, setStatus] = useState<WhatsAppStatus>('idle')
+  const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
   const { execute: configureWhatsapp, loading, error } = useTauriCommand<void>('configure_whatsapp')
+  const { execute: fetchDaemonApi } = useTauriCommand<string>('daemon_api_get')
   const [success, setSuccess] = useState(false)
+
+  // Poll for QR code when WhatsApp is enabled
+  useEffect(() => {
+    if (!enabled || !vmId) {
+      if (intervalRef.current) {
+        clearInterval(intervalRef.current)
+        intervalRef.current = null
+      }
+      setQrCode(null)
+      setStatus('idle')
+      return
+    }
+
+    const poll = async () => {
+      try {
+        const resp = await fetchDaemonApi({ path: '/channels/whatsapp/qr', vm_id: vmId })
+        if (resp) {
+          const data = JSON.parse(resp)
+          setQrCode(data.qr)
+          setStatus('waiting_qr')
+        }
+      } catch {
+        // 404 means no QR available (already authenticated or not started)
+        if (qrCode) {
+          // Had QR before, now gone = connected
+          setQrCode(null)
+          setStatus('connected')
+        }
+      }
+    }
+
+    poll()
+    intervalRef.current = setInterval(poll, 2000)
+
+    return () => {
+      if (intervalRef.current) {
+        clearInterval(intervalRef.current)
+        intervalRef.current = null
+      }
+    }
+  }, [enabled, vmId])
 
   const handleSave = async () => {
     setSuccess(false)
@@ -155,6 +196,7 @@ function WhatsAppConfig() {
       await configureWhatsapp({
         allowedNumbers: numbers,
         enabled,
+        vm_id: vmId,
       })
       setSuccess(true)
     } catch {
@@ -162,10 +204,17 @@ function WhatsAppConfig() {
     }
   }
 
+  const statusLabel = {
+    idle: 'Not started',
+    waiting_qr: 'Waiting for QR scan...',
+    connected: 'Connected',
+    disconnected: 'Disconnected',
+  }
+
   return (
     <div className="space-y-4 max-w-lg">
       <p className="text-gray-400 text-sm mb-4">
-        Configure WhatsApp integration. This feature is currently in development.
+        Configure WhatsApp integration. Scan the QR code with your phone to pair.
       </p>
 
       <Input
@@ -175,29 +224,28 @@ function WhatsAppConfig() {
         onChange={e => setAllowedNumbers(e.target.value)}
       />
 
-      <div className="flex items-center gap-3">
-        <label className="text-sm text-gray-300">Enabled</label>
-        <button
-          onClick={() => setEnabled(!enabled)}
-          className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
-            enabled ? 'bg-blue-600' : 'bg-gray-600'
-          }`}
-        >
-          <span
-            className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
-              enabled ? 'translate-x-6' : 'translate-x-1'
-            }`}
-          />
-        </button>
-      </div>
+      <Toggle label="Enabled" checked={enabled} onChange={setEnabled} />
 
       <div className="bg-gray-800 rounded-lg p-4 border border-gray-700">
-        <p className="text-sm text-gray-400">
-          QR Code pairing will appear here once the WhatsApp integration is fully implemented.
-        </p>
-        <div className="mt-3 w-48 h-48 bg-gray-900 rounded-lg flex items-center justify-center text-gray-600 text-sm border border-dashed border-gray-600">
-          QR Placeholder
+        <div className="flex items-center gap-2 mb-3">
+          <div className={`w-2 h-2 rounded-full ${
+            status === 'connected' ? 'bg-green-500' :
+            status === 'waiting_qr' ? 'bg-yellow-500 animate-pulse' :
+            status === 'disconnected' ? 'bg-red-500' :
+            'bg-gray-500'
+          }`} />
+          <p className="text-sm text-gray-400">{statusLabel[status]}</p>
         </div>
+
+        {qrCode ? (
+          <div className="bg-white rounded-lg p-3 inline-block">
+            <QRCodeSVG value={qrCode} size={192} />
+          </div>
+        ) : (
+          <div className="w-48 h-48 bg-gray-900 rounded-lg flex items-center justify-center text-gray-600 text-sm border border-dashed border-gray-600">
+            {status === 'connected' ? 'Paired' : 'QR code will appear here'}
+          </div>
+        )}
       </div>
 
       {error && <p className="text-red-400 text-sm">{error}</p>}

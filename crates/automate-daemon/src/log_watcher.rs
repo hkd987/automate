@@ -1,12 +1,12 @@
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use regex::Regex;
 use tokio::sync::Mutex;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 use uuid::Uuid;
 
 use crate::job_queue::{Job, JobSender};
@@ -119,7 +119,7 @@ impl LogWatcherManager {
     }
 
     async fn process_new_lines(
-        path: &PathBuf,
+        path: &Path,
         offset: &Arc<Mutex<u64>>,
         regex: &Regex,
         name: &str,
@@ -127,61 +127,80 @@ impl LogWatcherManager {
         job_sender: &JobSender,
     ) {
         let mut current_offset = offset.lock().await;
-        let file = match std::fs::File::open(path) {
-            Ok(f) => f,
+
+        // Perform blocking file I/O in a blocking task
+        let path_clone = path.to_path_buf();
+        let start_offset = *current_offset;
+        let regex_clone = regex.clone();
+        let read_result = tokio::task::spawn_blocking(move || {
+            let file = match std::fs::File::open(&path_clone) {
+                Ok(f) => f,
+                Err(_) => return (start_offset, Vec::new()),
+            };
+
+            let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
+            let mut offset = start_offset;
+
+            // Handle log rotation: if file is smaller than our offset, reset
+            if file_len < offset {
+                offset = 0;
+            }
+
+            if file_len <= offset {
+                return (offset, Vec::new());
+            }
+
+            let mut reader = BufReader::new(file);
+            if reader.seek(SeekFrom::Start(offset)).is_err() {
+                return (offset, Vec::new());
+            }
+
+            let mut matches = Vec::new();
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        offset += n as u64;
+                        let trimmed = line.trim().to_string();
+                        if regex_clone.is_match(&trimmed) {
+                            matches.push(trimmed);
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            (offset, matches)
+        })
+        .await;
+
+        let (new_offset, matches) = match read_result {
+            Ok(result) => result,
             Err(_) => return,
         };
 
-        let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
+        *current_offset = new_offset;
 
-        // Handle log rotation: if file is smaller than our offset, reset
-        if file_len < *current_offset {
-            *current_offset = 0;
-        }
+        for matched_line in matches {
+            let run_id = Uuid::new_v4();
+            let interpolated_prompt = prompt.replace("$LOG_MATCH", &matched_line);
+            let mut env = HashMap::new();
+            env.insert("LOG_MATCH".to_string(), matched_line.clone());
 
-        if file_len <= *current_offset {
-            return;
-        }
+            let job = Job {
+                automation_name: name.to_string(),
+                trigger_source: "log_watcher".to_string(),
+                prompt: interpolated_prompt,
+                env,
+                max_retries: crate::job_queue::DEFAULT_MAX_RETRIES,
+                retry_count: 0,
+            };
 
-        let mut reader = BufReader::new(file);
-        if reader.seek(SeekFrom::Start(*current_offset)).is_err() {
-            return;
-        }
-
-        let mut line = String::new();
-        loop {
-            line.clear();
-            match reader.read_line(&mut line) {
-                Ok(0) => break,
-                Ok(n) => {
-                    *current_offset += n as u64;
-                    let trimmed = line.trim();
-                    if regex.is_match(trimmed) {
-                        let run_id = Uuid::new_v4();
-                        let interpolated_prompt = prompt.replace("$LOG_MATCH", trimmed);
-                        let mut env = HashMap::new();
-                        env.insert("LOG_MATCH".to_string(), trimmed.to_string());
-
-                        let job = Job {
-                            automation_name: name.to_string(),
-                            trigger_source: "log_watcher".to_string(),
-                            prompt: interpolated_prompt,
-                            env,
-                            max_retries: crate::job_queue::DEFAULT_MAX_RETRIES,
-                            retry_count: 0,
-                        };
-
-                        if let Err(e) = job_sender.send((job, run_id)).await {
-                            error!(watcher = %name, error = %e, "Failed to enqueue log watcher job");
-                        } else {
-                            info!(watcher = %name, run_id = %run_id, matched_line = %trimmed, "Log watcher job enqueued");
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!(watcher = %name, error = %e, "Error reading log file");
-                    break;
-                }
+            if let Err(e) = job_sender.send((job, run_id)).await {
+                error!(watcher = %name, error = %e, "Failed to enqueue log watcher job");
+            } else {
+                info!(watcher = %name, run_id = %run_id, matched_line = %matched_line, "Log watcher job enqueued");
             }
         }
     }

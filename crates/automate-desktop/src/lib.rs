@@ -1,4 +1,5 @@
 pub mod commands;
+pub mod daemon_client;
 pub mod db;
 pub mod ssh;
 pub mod state;
@@ -26,6 +27,7 @@ pub fn run() {
             automation::deploy_automation,
             automation::list_remote_automations,
             automation::trigger_remote_run,
+            run_history::daemon_api_get,
             run_history::fetch_run_history,
             run_history::get_run_detail,
             auth::list_auth_profiles,

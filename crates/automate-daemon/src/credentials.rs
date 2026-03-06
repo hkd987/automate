@@ -1,47 +1,76 @@
 use std::collections::HashMap;
 
-use anyhow::Result;
+use aes_gcm::aead::{Aead, KeyInit, OsRng};
+use aes_gcm::{Aes256Gcm, Nonce};
+use anyhow::{Context, Result};
+use rand::RngCore;
 use rusqlite::{params, Connection};
+use sha2::Digest;
 use tracing::warn;
 
-const XOR_KEY: &[u8] = b"automate-dev-key-do-not-use-in-prod";
-
-fn xor_encrypt(data: &[u8], key: &[u8]) -> Vec<u8> {
-    data.iter()
-        .zip(key.iter().cycle())
-        .map(|(d, k)| d ^ k)
-        .collect()
+fn derive_key() -> [u8; 32] {
+    if let Ok(key_str) = std::env::var("AUTOMATE_ENCRYPTION_KEY") {
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(key_str.as_bytes());
+        hasher.finalize().into()
+    } else {
+        // Fallback: derive from hostname + username for dev
+        let hostname = hostname::get()
+            .map(|h| h.to_string_lossy().to_string())
+            .unwrap_or_else(|_| "localhost".to_string());
+        let username = std::env::var("USER")
+            .or_else(|_| std::env::var("USERNAME"))
+            .unwrap_or_else(|_| "default".to_string());
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(format!("automate:{}:{}", hostname, username).as_bytes());
+        hasher.finalize().into()
+    }
 }
 
-fn xor_decrypt(data: &[u8], key: &[u8]) -> Vec<u8> {
-    xor_encrypt(data, key) // XOR is symmetric
+fn encrypt(data: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
+    let key = derive_key();
+    let cipher = Aes256Gcm::new_from_slice(&key).context("invalid key length")?;
+
+    let mut nonce_bytes = [0u8; 12];
+    OsRng.fill_bytes(&mut nonce_bytes);
+    let nonce = Nonce::from_slice(&nonce_bytes);
+
+    let ciphertext = cipher
+        .encrypt(nonce, data)
+        .map_err(|e| anyhow::anyhow!("encryption failed: {}", e))?;
+
+    Ok((ciphertext, nonce_bytes.to_vec()))
 }
 
-pub fn init_credentials_table(conn: &Connection) -> Result<()> {
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS credentials (
-            key TEXT PRIMARY KEY,
-            encrypted_value BLOB NOT NULL
-        );",
-    )?;
-    Ok(())
+fn decrypt(ciphertext: &[u8], nonce_bytes: &[u8]) -> Result<Vec<u8>> {
+    let key = derive_key();
+    let cipher = Aes256Gcm::new_from_slice(&key).context("invalid key length")?;
+
+    let nonce = Nonce::from_slice(nonce_bytes);
+    let plaintext = cipher
+        .decrypt(nonce, ciphertext)
+        .map_err(|e| anyhow::anyhow!("decryption failed: {}", e))?;
+
+    Ok(plaintext)
 }
 
 pub fn set_credential(conn: &Connection, key: &str, value: &str) -> Result<()> {
-    let encrypted = xor_encrypt(value.as_bytes(), XOR_KEY);
+    let (encrypted, nonce) = encrypt(value.as_bytes())?;
     conn.execute(
-        "INSERT OR REPLACE INTO credentials (key, encrypted_value) VALUES (?1, ?2)",
-        params![key, encrypted],
+        "INSERT OR REPLACE INTO credentials (key, encrypted_value, nonce) VALUES (?1, ?2, ?3)",
+        params![key, encrypted, nonce],
     )?;
     Ok(())
 }
 
 pub fn get_credential(conn: &Connection, key: &str) -> Result<Option<String>> {
-    let mut stmt = conn.prepare("SELECT encrypted_value FROM credentials WHERE key=?1")?;
-    let mut rows = stmt.query_map(params![key], |row| row.get::<_, Vec<u8>>(0))?;
+    let mut stmt = conn.prepare("SELECT encrypted_value, nonce FROM credentials WHERE key=?1")?;
+    let mut rows = stmt.query_map(params![key], |row| {
+        Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+    })?;
     match rows.next() {
-        Some(Ok(encrypted)) => {
-            let decrypted = xor_decrypt(&encrypted, XOR_KEY);
+        Some(Ok((encrypted, nonce))) => {
+            let decrypted = decrypt(&encrypted, &nonce)?;
             Ok(Some(String::from_utf8(decrypted)?))
         }
         Some(Err(e)) => Err(e.into()),
@@ -70,30 +99,6 @@ pub fn get_credentials_for_job(
 ) -> HashMap<String, String> {
     let mut env = HashMap::new();
 
-    // Try automation-specific credentials first, then fall back to global ones
-    let prefixed_keys = [
-        (
-            format!("{}.ANTHROPIC_API_KEY", automation_name),
-            "ANTHROPIC_API_KEY",
-        ),
-        (
-            format!("{}.OPENAI_API_KEY", automation_name),
-            "OPENAI_API_KEY",
-        ),
-        (
-            format!("{}.AWS_ACCESS_KEY_ID", automation_name),
-            "AWS_ACCESS_KEY_ID",
-        ),
-        (
-            format!("{}.AWS_SECRET_ACCESS_KEY", automation_name),
-            "AWS_SECRET_ACCESS_KEY",
-        ),
-        (
-            format!("{}.AWS_DEFAULT_REGION", automation_name),
-            "AWS_DEFAULT_REGION",
-        ),
-    ];
-
     let global_keys = [
         "ANTHROPIC_API_KEY",
         "OPENAI_API_KEY",
@@ -102,18 +107,28 @@ pub fn get_credentials_for_job(
         "AWS_DEFAULT_REGION",
     ];
 
-    // Check automation-specific keys
-    for (prefixed_key, env_name) in &prefixed_keys {
-        if let Ok(Some(val)) = get_credential(conn, prefixed_key) {
-            env.insert(env_name.to_string(), val);
+    // Fetch all credentials in one query and filter in memory
+    let all_creds = match list_all_credentials(conn) {
+        Ok(creds) => creds,
+        Err(e) => {
+            warn!(automation = automation_name, error = %e, "Failed to fetch credentials");
+            return env;
+        }
+    };
+
+    // Check automation-specific keys first
+    for key in &global_keys {
+        let prefixed = format!("{}.{}", automation_name, key);
+        if let Some(val) = all_creds.get(&prefixed) {
+            env.insert(key.to_string(), val.clone());
         }
     }
 
     // Fill in any missing from global keys
     for key in &global_keys {
         if !env.contains_key(*key) {
-            if let Ok(Some(val)) = get_credential(conn, key) {
-                env.insert(key.to_string(), val);
+            if let Some(val) = all_creds.get(*key) {
+                env.insert(key.to_string(), val.clone());
             }
         }
     }
@@ -125,22 +140,42 @@ pub fn get_credentials_for_job(
     env
 }
 
+fn list_all_credentials(conn: &Connection) -> Result<HashMap<String, String>> {
+    let mut stmt = conn.prepare("SELECT key, encrypted_value, nonce FROM credentials")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, Vec<u8>>(1)?,
+            row.get::<_, Vec<u8>>(2)?,
+        ))
+    })?;
+    let mut creds = HashMap::new();
+    for row in rows {
+        let (key, encrypted, nonce) = row?;
+        if let Ok(decrypted) = decrypt(&encrypted, &nonce) {
+            if let Ok(val) = String::from_utf8(decrypted) {
+                creds.insert(key, val);
+            }
+        }
+    }
+    Ok(creds)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db;
 
     fn setup() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
-        init_credentials_table(&conn).unwrap();
-        conn
+        db::init_db_in_memory().unwrap()
     }
 
     #[test]
     fn encrypt_decrypt_round_trip() {
         let original = "my-secret-api-key-12345";
-        let encrypted = xor_encrypt(original.as_bytes(), XOR_KEY);
+        let (encrypted, nonce) = encrypt(original.as_bytes()).unwrap();
         assert_ne!(encrypted, original.as_bytes());
-        let decrypted = xor_decrypt(&encrypted, XOR_KEY);
+        let decrypted = decrypt(&encrypted, &nonce).unwrap();
         assert_eq!(String::from_utf8(decrypted).unwrap(), original);
     }
 

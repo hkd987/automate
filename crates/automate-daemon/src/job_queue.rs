@@ -116,6 +116,9 @@ pub async fn run_consumer_with_sender(
             env.extend(creds);
         }
 
+        // Interpolate prompt variables
+        let prompt = job.prompt.replace("$TIMESTAMP", &Utc::now().to_rfc3339());
+
         let start = Instant::now();
 
         // Create log stream if manager is available
@@ -127,12 +130,12 @@ pub async fn run_consumer_with_sender(
 
         // Run the agent with streaming support
         let (status, output, error) = match runtime
-            .run_streaming(&job.prompt, env, broadcaster.clone())
+            .run_streaming(&prompt, env, broadcaster.clone())
             .await
         {
             Ok(run_output) => {
                 let combined_output = format_output(&run_output);
-                write_log_file(run_id, &combined_output);
+                write_log_file(run_id, &combined_output).await;
 
                 if run_output.exit_code == 0 {
                     (RunStatus::Completed, Some(run_output.stdout), None)
@@ -146,7 +149,7 @@ pub async fn run_consumer_with_sender(
             }
             Err(e) => {
                 let err_msg = e.to_string();
-                write_log_file(run_id, &format!("Agent error: {}", err_msg));
+                write_log_file(run_id, &format!("Agent error: {}", err_msg)).await;
                 (RunStatus::Failed, None, Some(err_msg))
             }
         };
@@ -248,15 +251,19 @@ fn format_output(output: &RunOutput) -> String {
     result
 }
 
-fn write_log_file(run_id: Uuid, content: &str) {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    let log_dir = std::path::Path::new(&home).join(".automate/logs");
-    if std::fs::create_dir_all(&log_dir).is_ok() {
-        let log_path = log_dir.join(format!("{}.log", run_id));
-        if let Err(e) = std::fs::write(&log_path, content) {
-            warn!(error = %e, path = %log_path.display(), "Failed to write log file");
+async fn write_log_file(run_id: Uuid, content: &str) {
+    let content = content.to_string();
+    let _ = tokio::task::spawn_blocking(move || {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        let log_dir = std::path::Path::new(&home).join(".automate/logs");
+        if std::fs::create_dir_all(&log_dir).is_ok() {
+            let log_path = log_dir.join(format!("{}.log", run_id));
+            if let Err(e) = std::fs::write(&log_path, &content) {
+                warn!(error = %e, path = %log_path.display(), "Failed to write log file");
+            }
         }
-    }
+    })
+    .await;
 }
 
 /// Calculate exponential backoff duration.
@@ -387,7 +394,7 @@ mod tests {
         run_consumer(rx, db.clone(), mock_runtime).await;
 
         let conn = db.lock().await;
-        let runs = db::list_runs(&conn).unwrap();
+        let runs = db::list_runs(&conn, None).unwrap();
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].status, RunStatus::Completed);
         assert_eq!(runs[0].output, Some("mock agent output".to_string()));
@@ -425,7 +432,7 @@ mod tests {
         run_consumer(rx, db.clone(), failing_runtime).await;
 
         let conn = db.lock().await;
-        let runs = db::list_runs(&conn).unwrap();
+        let runs = db::list_runs(&conn, None).unwrap();
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].status, RunStatus::Failed);
         assert!(runs[0].error.is_some());

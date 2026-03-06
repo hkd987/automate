@@ -77,10 +77,18 @@ pub async fn list_vms(state: tauri::State<'_, AppState>) -> Result<Vec<VmProfile
 
 #[tauri::command]
 pub async fn test_connection(
-    _host: String,
-    _port: u16,
-    _user: String,
-    _key_path: String,
+    host: String,
+    port: u16,
+    user: String,
+    key_path: String,
 ) -> Result<String, String> {
-    Ok("Connection test successful (placeholder)".to_string())
+    let ssh = crate::ssh::SshConnection::new(
+        host,
+        port,
+        user,
+        std::path::PathBuf::from(key_path),
+    );
+    ssh.connect().await.map_err(|e| e.to_string())?;
+    let arch = ssh.detect_arch().await.map_err(|e| e.to_string())?;
+    Ok(arch)
 }

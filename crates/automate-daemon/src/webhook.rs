@@ -19,10 +19,14 @@ use crate::job_queue::{Job, JobSender};
 
 type HmacSha256 = Hmac<Sha256>;
 
+pub struct WebhookEntry {
+    pub secret: String,
+    pub prompt: String,
+}
+
 #[derive(Clone)]
 pub struct WebhookState {
-    pub secrets: Arc<Mutex<HashMap<String, String>>>,
-    pub prompts: Arc<Mutex<HashMap<String, String>>>,
+    pub entries: Arc<Mutex<HashMap<String, WebhookEntry>>>,
     pub job_tx: JobSender,
 }
 
@@ -49,9 +53,12 @@ async fn handle_webhook(
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
-    let secrets = state.secrets.lock().await;
-    let secret = match secrets.get(&name) {
-        Some(s) => s.clone(),
+    let entries = state.entries.lock().await;
+    let entry = match entries.get(&name) {
+        Some(e) => WebhookEntry {
+            secret: e.secret.clone(),
+            prompt: e.prompt.clone(),
+        },
         None => {
             return (
                 StatusCode::NOT_FOUND,
@@ -60,7 +67,7 @@ async fn handle_webhook(
                 .into_response();
         }
     };
-    drop(secrets);
+    drop(entries);
 
     // Validate HMAC signature
     let signature = match headers.get("X-Signature-256") {
@@ -86,7 +93,7 @@ async fn handle_webhook(
     // Strip optional "sha256=" prefix
     let sig_hex = signature.strip_prefix("sha256=").unwrap_or(&signature);
 
-    if !verify_hmac(&secret, &body, sig_hex) {
+    if !verify_hmac(&entry.secret, &body, sig_hex) {
         warn!(webhook = %name, "Invalid HMAC signature");
         return (
             StatusCode::UNAUTHORIZED,
@@ -97,14 +104,7 @@ async fn handle_webhook(
 
     let body_str = String::from_utf8_lossy(&body).to_string();
 
-    // Get the prompt for this webhook
-    let prompts = state.prompts.lock().await;
-    let prompt = prompts
-        .get(&name)
-        .cloned()
-        .unwrap_or_default()
-        .replace("$WEBHOOK_BODY", &body_str);
-    drop(prompts);
+    let prompt = entry.prompt.replace("$WEBHOOK_BODY", &body_str);
 
     let run_id = Uuid::new_v4();
     let mut env = HashMap::new();
@@ -150,15 +150,18 @@ mod tests {
     }
 
     fn setup_webhook_app(name: &str, secret: &str, prompt: &str) -> Router {
-        let mut secrets = HashMap::new();
-        secrets.insert(name.to_string(), secret.to_string());
-        let mut prompts = HashMap::new();
-        prompts.insert(name.to_string(), prompt.to_string());
+        let mut entries = HashMap::new();
+        entries.insert(
+            name.to_string(),
+            WebhookEntry {
+                secret: secret.to_string(),
+                prompt: prompt.to_string(),
+            },
+        );
 
         let (tx, _rx) = crate::job_queue::create_channel(10);
         let state = WebhookState {
-            secrets: Arc::new(Mutex::new(secrets)),
-            prompts: Arc::new(Mutex::new(prompts)),
+            entries: Arc::new(Mutex::new(entries)),
             job_tx: tx,
         };
         create_webhook_router(state)
@@ -167,17 +170,17 @@ mod tests {
     #[tokio::test]
     async fn test_valid_hmac_enqueues_job() {
         let (tx, mut rx) = crate::job_queue::create_channel(10);
-        let mut secrets = HashMap::new();
-        secrets.insert("test-hook".to_string(), "my-secret".to_string());
-        let mut prompts = HashMap::new();
-        prompts.insert(
+        let mut entries = HashMap::new();
+        entries.insert(
             "test-hook".to_string(),
-            "Process: $WEBHOOK_BODY".to_string(),
+            WebhookEntry {
+                secret: "my-secret".to_string(),
+                prompt: "Process: $WEBHOOK_BODY".to_string(),
+            },
         );
 
         let state = WebhookState {
-            secrets: Arc::new(Mutex::new(secrets)),
-            prompts: Arc::new(Mutex::new(prompts)),
+            entries: Arc::new(Mutex::new(entries)),
             job_tx: tx,
         };
         let app = create_webhook_router(state);
@@ -273,17 +276,17 @@ mod tests {
     #[tokio::test]
     async fn test_webhook_body_interpolation() {
         let (tx, mut rx) = crate::job_queue::create_channel(10);
-        let mut secrets = HashMap::new();
-        secrets.insert("interp".to_string(), "secret".to_string());
-        let mut prompts = HashMap::new();
-        prompts.insert(
+        let mut entries = HashMap::new();
+        entries.insert(
             "interp".to_string(),
-            "Handle event: $WEBHOOK_BODY done".to_string(),
+            WebhookEntry {
+                secret: "secret".to_string(),
+                prompt: "Handle event: $WEBHOOK_BODY done".to_string(),
+            },
         );
 
         let state = WebhookState {
-            secrets: Arc::new(Mutex::new(secrets)),
-            prompts: Arc::new(Mutex::new(prompts)),
+            entries: Arc::new(Mutex::new(entries)),
             job_tx: tx,
         };
         let app = create_webhook_router(state);

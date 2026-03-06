@@ -29,6 +29,7 @@ pub struct AppState {
     pub start_time: Instant,
     pub version: String,
     pub github_repo: String,
+    pub whatsapp_qr: Arc<Mutex<Option<String>>>,
 }
 
 #[derive(Serialize)]
@@ -100,6 +101,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/credentials/:key", delete(delete_credential))
         .route("/update/check", get(check_update))
         .route("/update/apply", post(apply_update))
+        .route("/channels/whatsapp/qr", get(get_whatsapp_qr))
         .with_state(state)
 }
 
@@ -298,9 +300,16 @@ async fn delete_automation(
     }
 }
 
-async fn list_runs(State(state): State<AppState>) -> impl IntoResponse {
+async fn list_runs(
+    State(state): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let limit = params
+        .get("limit")
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(100);
     let conn = state.db.lock().await;
-    match db::list_runs(&conn) {
+    match db::list_runs(&conn, Some(limit)) {
         Ok(runs) => Json(runs).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -483,6 +492,32 @@ async fn apply_update(State(state): State<AppState>) -> impl IntoResponse {
     }
 }
 
+// --- WhatsApp QR endpoint ---
+
+#[derive(Serialize)]
+struct WhatsAppQrResponse {
+    qr: String,
+}
+
+async fn get_whatsapp_qr(State(state): State<AppState>) -> impl IntoResponse {
+    let qr = state.whatsapp_qr.lock().await;
+    match qr.as_ref() {
+        Some(qr_data) => Json(WhatsAppQrResponse {
+            qr: qr_data.clone(),
+        })
+        .into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::to_value(ErrorResponse::not_found(
+                "No QR code available. Either already authenticated or not yet started."
+                    .to_string(),
+            ))
+            .unwrap()),
+        )
+            .into_response(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -500,6 +535,7 @@ mod tests {
             start_time: Instant::now(),
             version: "0.1.0-test".to_string(),
             github_repo: "test/repo".to_string(),
+            whatsapp_qr: Arc::new(Mutex::new(None)),
         };
         create_router(state)
     }
@@ -579,6 +615,7 @@ mod tests {
             start_time: Instant::now(),
             version: "0.1.0-test".to_string(),
             github_repo: "test/repo".to_string(),
+            whatsapp_qr: Arc::new(Mutex::new(None)),
         };
         let app = create_router(state);
 
@@ -623,6 +660,7 @@ mod tests {
             start_time: Instant::now(),
             version: "0.1.0-test".to_string(),
             github_repo: "test/repo".to_string(),
+            whatsapp_qr: Arc::new(Mutex::new(None)),
         };
         let app = create_router(state);
 
@@ -671,6 +709,7 @@ mod tests {
             start_time: Instant::now(),
             version: "0.1.0-test".to_string(),
             github_repo: "test/repo".to_string(),
+            whatsapp_qr: Arc::new(Mutex::new(None)),
         };
         let app = create_router(state);
 
@@ -762,6 +801,7 @@ mod tests {
             start_time: Instant::now(),
             version: "0.1.0-test".to_string(),
             github_repo: "test/repo".to_string(),
+            whatsapp_qr: Arc::new(Mutex::new(None)),
         };
         let app = create_router(state);
 
@@ -962,6 +1002,7 @@ mod tests {
             start_time: Instant::now(),
             version: "0.1.0-test".to_string(),
             github_repo: "test/repo".to_string(),
+            whatsapp_qr: Arc::new(Mutex::new(None)),
         };
         let app = create_router(state);
 

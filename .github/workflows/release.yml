@@ -44,7 +44,7 @@ jobs:
           cp target/${{ matrix.target }}/release/automate-daemon dist/automate-daemon-${{ matrix.target }}
           cd dist && sha256sum automate-daemon-${{ matrix.target }} > automate-daemon-${{ matrix.target }}.sha256
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: daemon-${{ matrix.target }}
           path: dist/

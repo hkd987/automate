@@ -3,16 +3,14 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use chrono::Utc;
-use rusqlite::Connection;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::mpsc;
 use tracing::{info, warn};
 use uuid::Uuid;
 
 use automate_shared::models::{RunRecord, RunStatus};
+use automate_shared::store::Store;
 
 use crate::agent::{AgentRuntime, RunOutput};
-use crate::credentials;
-use crate::db;
 use crate::log_stream::LogStreamManager;
 
 pub const DEFAULT_MAX_RETRIES: u32 = 3;
@@ -56,26 +54,22 @@ pub fn create_channel(buffer: usize) -> (JobSender, JobReceiver) {
     mpsc::channel(buffer)
 }
 
-pub async fn run_consumer(
-    rx: JobReceiver,
-    db: Arc<Mutex<Connection>>,
-    runtime: Arc<dyn AgentRuntime>,
-) {
-    run_consumer_with_sender(rx, db, runtime, None, None).await
+pub async fn run_consumer<S: Store>(rx: JobReceiver, store: S, runtime: Arc<dyn AgentRuntime>) {
+    run_consumer_with_sender(rx, store, runtime, None, None).await
 }
 
-pub async fn run_consumer_with_log_stream(
+pub async fn run_consumer_with_log_stream<S: Store>(
     rx: JobReceiver,
-    db: Arc<Mutex<Connection>>,
+    store: S,
     runtime: Arc<dyn AgentRuntime>,
     log_stream_mgr: Arc<LogStreamManager>,
 ) {
-    run_consumer_with_sender(rx, db, runtime, None, Some(log_stream_mgr)).await
+    run_consumer_with_sender(rx, store, runtime, None, Some(log_stream_mgr)).await
 }
 
-pub async fn run_consumer_with_sender(
+pub async fn run_consumer_with_sender<S: Store>(
     mut rx: JobReceiver,
-    db: Arc<Mutex<Connection>>,
+    store: S,
     runtime: Arc<dyn AgentRuntime>,
     retry_tx: Option<JobSender>,
     log_stream_mgr: Option<Arc<LogStreamManager>>,
@@ -92,7 +86,6 @@ pub async fn run_consumer_with_sender(
 
         // Mark as running
         {
-            let conn = db.lock().await;
             let run = RunRecord {
                 id: run_id,
                 automation_name: job.automation_name.clone(),
@@ -103,18 +96,16 @@ pub async fn run_consumer_with_sender(
                 output: None,
                 error: None,
             };
-            if let Err(e) = db::update_run(&conn, &run) {
+            if let Err(e) = store.update_run(&run).await {
                 warn!(error = %e, "Failed to update run status to running");
             }
         }
 
         // Get credentials for this job
         let mut env = job.env.clone();
-        {
-            let conn = db.lock().await;
-            let creds = credentials::get_credentials_for_job(&conn, &job.automation_name);
-            env.extend(creds);
-        }
+        let creds =
+            automate_shared::store::get_credentials_for_job(&store, &job.automation_name).await;
+        env.extend(creds);
 
         // Interpolate prompt variables
         let prompt = job.prompt.replace("$TIMESTAMP", &Utc::now().to_rfc3339());
@@ -164,7 +155,6 @@ pub async fn run_consumer_with_sender(
 
         // Record this attempt
         {
-            let conn = db.lock().await;
             let run = RunRecord {
                 id: run_id,
                 automation_name: job.automation_name.clone(),
@@ -175,7 +165,7 @@ pub async fn run_consumer_with_sender(
                 output: output.clone(),
                 error: error.clone(),
             };
-            if let Err(e) = db::update_run(&conn, &run) {
+            if let Err(e) = store.update_run(&run).await {
                 warn!(error = %e, "Failed to update run record");
             }
         }
@@ -200,7 +190,6 @@ pub async fn run_consumer_with_sender(
 
             // Insert a new pending run record for the retry
             {
-                let conn = db.lock().await;
                 let run = RunRecord {
                     id: new_run_id,
                     automation_name: retried_job.automation_name.clone(),
@@ -211,7 +200,7 @@ pub async fn run_consumer_with_sender(
                     output: None,
                     error: None,
                 };
-                if let Err(e) = db::insert_run(&conn, &run) {
+                if let Err(e) = store.insert_run(&run).await {
                     warn!(error = %e, "Failed to insert retry run record");
                 }
             }
@@ -277,6 +266,7 @@ pub fn exponential_backoff(attempt: u32, base_secs: u64, max_secs: u64) -> std::
 mod tests {
     use super::*;
     use crate::agent::{AgentError, AgentRuntime};
+    use crate::store_sqlx::SqlxStore;
     use std::time::Duration;
 
     struct MockRuntime {
@@ -356,8 +346,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_consumer_with_mock_agent() {
-        let conn = db::init_db_in_memory().unwrap();
-        let db = Arc::new(Mutex::new(conn));
+        let store = SqlxStore::connect_in_memory().await.unwrap();
 
         let mock_runtime = Arc::new(MockRuntime {
             output: RunOutput {
@@ -372,29 +361,24 @@ mod tests {
         let run_id = Uuid::new_v4();
         let job = make_job("consumer-test");
 
-        // Insert initial run record
-        {
-            let conn = db.lock().await;
-            let run = RunRecord {
-                id: run_id,
-                automation_name: "consumer-test".to_string(),
-                status: RunStatus::Pending,
-                trigger_source: "manual".to_string(),
-                started_at: Utc::now(),
-                finished_at: None,
-                output: None,
-                error: None,
-            };
-            db::insert_run(&conn, &run).unwrap();
-        }
+        let run = RunRecord {
+            id: run_id,
+            automation_name: "consumer-test".to_string(),
+            status: RunStatus::Pending,
+            trigger_source: "manual".to_string(),
+            started_at: Utc::now(),
+            finished_at: None,
+            output: None,
+            error: None,
+        };
+        store.insert_run(&run).await.unwrap();
 
         tx.send((job, run_id)).await.unwrap();
         drop(tx);
 
-        run_consumer(rx, db.clone(), mock_runtime).await;
+        run_consumer(rx, store.clone(), mock_runtime).await;
 
-        let conn = db.lock().await;
-        let runs = db::list_runs(&conn, None).unwrap();
+        let runs = store.list_runs(None).await.unwrap();
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].status, RunStatus::Completed);
         assert_eq!(runs[0].output, Some("mock agent output".to_string()));
@@ -402,8 +386,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_consumer_with_failing_agent() {
-        let conn = db::init_db_in_memory().unwrap();
-        let db = Arc::new(Mutex::new(conn));
+        let store = SqlxStore::connect_in_memory().await.unwrap();
 
         let failing_runtime = Arc::new(FailingRuntime);
 
@@ -411,28 +394,24 @@ mod tests {
         let run_id = Uuid::new_v4();
         let job = make_job("fail-test");
 
-        {
-            let conn = db.lock().await;
-            let run = RunRecord {
-                id: run_id,
-                automation_name: "fail-test".to_string(),
-                status: RunStatus::Pending,
-                trigger_source: "manual".to_string(),
-                started_at: Utc::now(),
-                finished_at: None,
-                output: None,
-                error: None,
-            };
-            db::insert_run(&conn, &run).unwrap();
-        }
+        let run = RunRecord {
+            id: run_id,
+            automation_name: "fail-test".to_string(),
+            status: RunStatus::Pending,
+            trigger_source: "manual".to_string(),
+            started_at: Utc::now(),
+            finished_at: None,
+            output: None,
+            error: None,
+        };
+        store.insert_run(&run).await.unwrap();
 
         tx.send((job, run_id)).await.unwrap();
         drop(tx);
 
-        run_consumer(rx, db.clone(), failing_runtime).await;
+        run_consumer(rx, store.clone(), failing_runtime).await;
 
-        let conn = db.lock().await;
-        let runs = db::list_runs(&conn, None).unwrap();
+        let runs = store.list_runs(None).await.unwrap();
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].status, RunStatus::Failed);
         assert!(runs[0].error.is_some());
@@ -440,12 +419,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_retry_on_failure() {
-        let conn = db::init_db_in_memory().unwrap();
-        let db = Arc::new(Mutex::new(conn));
+        let store = SqlxStore::connect_in_memory().await.unwrap();
 
         let failing_runtime = Arc::new(FailingRuntime);
 
-        // Create channels: main consumer reads from rx, retries go to retry_tx -> retry_rx
         let (tx, rx) = create_channel(10);
         let (retry_tx, mut retry_rx) = create_channel(10);
 
@@ -454,27 +431,23 @@ mod tests {
         job.max_retries = 2;
         job.retry_count = 0;
 
-        {
-            let conn = db.lock().await;
-            let run = RunRecord {
-                id: run_id,
-                automation_name: "retry-test".to_string(),
-                status: RunStatus::Pending,
-                trigger_source: "manual".to_string(),
-                started_at: Utc::now(),
-                finished_at: None,
-                output: None,
-                error: None,
-            };
-            db::insert_run(&conn, &run).unwrap();
-        }
+        let run = RunRecord {
+            id: run_id,
+            automation_name: "retry-test".to_string(),
+            status: RunStatus::Pending,
+            trigger_source: "manual".to_string(),
+            started_at: Utc::now(),
+            finished_at: None,
+            output: None,
+            error: None,
+        };
+        store.insert_run(&run).await.unwrap();
 
         tx.send((job, run_id)).await.unwrap();
         drop(tx);
 
-        run_consumer_with_sender(rx, db.clone(), failing_runtime, Some(retry_tx), None).await;
+        run_consumer_with_sender(rx, store, failing_runtime, Some(retry_tx), None).await;
 
-        // A retry job should have been enqueued
         let (retried_job, _new_run_id) = retry_rx.recv().await.unwrap();
         assert_eq!(retried_job.retry_count, 1);
         assert_eq!(retried_job.automation_name, "retry-test");
@@ -482,8 +455,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_no_retry_after_max() {
-        let conn = db::init_db_in_memory().unwrap();
-        let db = Arc::new(Mutex::new(conn));
+        let store = SqlxStore::connect_in_memory().await.unwrap();
 
         let failing_runtime = Arc::new(FailingRuntime);
 
@@ -493,31 +465,26 @@ mod tests {
         let run_id = Uuid::new_v4();
         let mut job = make_job("max-retry-test");
         job.max_retries = 2;
-        job.retry_count = 2; // Already at max
+        job.retry_count = 2;
 
-        {
-            let conn = db.lock().await;
-            let run = RunRecord {
-                id: run_id,
-                automation_name: "max-retry-test".to_string(),
-                status: RunStatus::Pending,
-                trigger_source: "manual".to_string(),
-                started_at: Utc::now(),
-                finished_at: None,
-                output: None,
-                error: None,
-            };
-            db::insert_run(&conn, &run).unwrap();
-        }
+        let run = RunRecord {
+            id: run_id,
+            automation_name: "max-retry-test".to_string(),
+            status: RunStatus::Pending,
+            trigger_source: "manual".to_string(),
+            started_at: Utc::now(),
+            finished_at: None,
+            output: None,
+            error: None,
+        };
+        store.insert_run(&run).await.unwrap();
 
         tx.send((job, run_id)).await.unwrap();
         drop(tx);
 
-        run_consumer_with_sender(rx, db.clone(), failing_runtime, Some(retry_tx), None).await;
+        run_consumer_with_sender(rx, store, failing_runtime, Some(retry_tx), None).await;
 
-        // No retry should be enqueued
         drop(retry_rx.try_recv().ok());
-        // Channel should be empty after drop of sender
     }
 
     #[tokio::test]
@@ -533,8 +500,8 @@ mod tests {
         assert_eq!(exponential_backoff(1, 1, 60), Duration::from_secs(2));
         assert_eq!(exponential_backoff(2, 1, 60), Duration::from_secs(4));
         assert_eq!(exponential_backoff(3, 1, 60), Duration::from_secs(8));
-        assert_eq!(exponential_backoff(6, 1, 60), Duration::from_secs(60)); // capped
-        assert_eq!(exponential_backoff(10, 1, 60), Duration::from_secs(60)); // capped
+        assert_eq!(exponential_backoff(6, 1, 60), Duration::from_secs(60));
+        assert_eq!(exponential_backoff(10, 1, 60), Duration::from_secs(60));
     }
 
     #[test]

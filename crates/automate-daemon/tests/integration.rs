@@ -4,9 +4,12 @@ use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::http::Request;
-use rusqlite::Connection;
 use tokio::sync::Mutex;
 use tower::ServiceExt;
+
+use automate_daemon::api::{AppState, DaemonMeta, WhatsAppQrState};
+use automate_daemon::log_stream::LogStreamManager;
+use automate_daemon::store_sqlx::SqlxStore;
 
 // We test the full pipeline: register automation -> trigger run -> agent runs -> verify result
 
@@ -35,31 +38,31 @@ impl automate_daemon::agent::AgentRuntime for MockAgentRuntime {
     }
 }
 
-fn setup_test_app(
-    runtime: Arc<dyn automate_daemon::agent::AgentRuntime>,
-) -> (axum::Router, Arc<Mutex<Connection>>) {
-    let conn = automate_daemon::db::init_db_in_memory().unwrap();
-    let db = Arc::new(Mutex::new(conn));
+async fn setup_test_app(runtime: Arc<dyn automate_daemon::agent::AgentRuntime>) -> axum::Router {
+    let store = SqlxStore::connect_in_memory().await.unwrap();
 
     let (job_tx, job_rx) = automate_daemon::job_queue::create_channel(100);
 
-    let consumer_db = db.clone();
+    let consumer_store = store.clone();
     let consumer_runtime = runtime.clone();
     tokio::spawn(async move {
-        automate_daemon::job_queue::run_consumer(job_rx, consumer_db, consumer_runtime).await;
+        automate_daemon::job_queue::run_consumer(job_rx, consumer_store, consumer_runtime).await;
     });
 
-    let state = automate_daemon::api::AppState {
-        db: db.clone(),
+    let state = AppState {
+        store,
         job_tx,
-        start_time: Instant::now(),
-        version: "0.1.0-test".to_string(),
-        github_repo: "lumatthews/automate".to_string(),
-        whatsapp_qr: Arc::new(tokio::sync::Mutex::new(None)),
+        meta: DaemonMeta {
+            start_time: Instant::now(),
+            version: "0.1.0-test".to_string(),
+            github_repo: "lumatthews/automate".to_string(),
+        },
+        whatsapp_qr: WhatsAppQrState(Arc::new(Mutex::new(None))),
+        log_stream_mgr: Arc::new(LogStreamManager::new()),
+        webhook_entries: Arc::new(Mutex::new(HashMap::new())),
     };
 
-    let app = automate_daemon::api::create_router(state);
-    (app, db)
+    automate_daemon::api::create_router(state)
 }
 
 #[tokio::test]
@@ -69,7 +72,7 @@ async fn e2e_register_trigger_and_verify_run() {
         exit_code: 0,
     });
 
-    let (app, _db) = setup_test_app(mock_runtime);
+    let app = setup_test_app(mock_runtime).await;
 
     // Step 1: Register an automation
     let resp = app
@@ -162,7 +165,7 @@ async fn e2e_failing_agent_records_error() {
     }
 
     let failing_runtime = Arc::new(FailingAgent);
-    let (app, _db) = setup_test_app(failing_runtime);
+    let app = setup_test_app(failing_runtime).await;
 
     // Register
     let _ = app

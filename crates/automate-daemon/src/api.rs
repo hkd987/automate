@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -9,28 +10,46 @@ use axum::{
     Json, Router,
 };
 use chrono::Utc;
-use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use automate_shared::config::AutomationDef;
 use automate_shared::models::{RunRecord, RunStatus};
+use automate_shared::store::Store;
 
-use crate::credentials;
-use crate::db;
 use crate::job_queue::{Job, JobSender};
+use crate::log_stream::LogStreamManager;
+use crate::log_stream_sse;
+use crate::log_stream_ws;
 use crate::updater;
+use crate::webhook::{self, WebhookEntry};
+
+// --- Sub-state types for FromRef extraction ---
 
 #[derive(Clone)]
-pub struct AppState {
-    pub db: Arc<Mutex<Connection>>,
-    pub job_tx: JobSender,
+pub struct DaemonMeta {
     pub start_time: Instant,
     pub version: String,
     pub github_repo: String,
-    pub whatsapp_qr: Arc<Mutex<Option<String>>>,
 }
+
+#[derive(Clone)]
+pub struct WhatsAppQrState(pub Arc<Mutex<Option<String>>>);
+
+// --- Composable AppState ---
+
+#[derive(Clone)]
+pub struct AppState<S: Store> {
+    pub store: S,
+    pub job_tx: JobSender,
+    pub meta: DaemonMeta,
+    pub whatsapp_qr: WhatsAppQrState,
+    pub log_stream_mgr: Arc<LogStreamManager>,
+    pub webhook_entries: Arc<Mutex<HashMap<String, WebhookEntry>>>,
+}
+
+// --- Response types ---
 
 #[derive(Serialize)]
 struct HealthResponse {
@@ -88,27 +107,41 @@ struct RunTriggerResponse {
     status: RunStatus,
 }
 
-pub fn create_router(state: AppState) -> Router {
+// --- Router ---
+
+pub fn create_router<S: Store>(state: AppState<S>) -> Router {
     Router::new()
-        .route("/health", get(health))
-        .route("/automations", post(create_automation))
-        .route("/automations", get(list_automations))
-        .route("/automations/:name/run", post(trigger_run))
-        .route("/automations/:name", delete(delete_automation))
-        .route("/runs", get(list_runs))
-        .route("/credentials", post(set_credential))
-        .route("/credentials/keys", get(list_credential_keys))
-        .route("/credentials/:key", delete(delete_credential))
-        .route("/update/check", get(check_update))
-        .route("/update/apply", post(apply_update))
-        .route("/channels/whatsapp/qr", get(get_whatsapp_qr))
+        // Core API routes
+        .route("/health", get(health::<S>))
+        .route("/automations", post(create_automation::<S>))
+        .route("/automations", get(list_automations::<S>))
+        .route("/automations/:name/run", post(trigger_run::<S>))
+        .route("/automations/:name", delete(delete_automation::<S>))
+        .route("/runs", get(list_runs::<S>))
+        .route("/credentials", post(set_credential::<S>))
+        .route("/credentials/keys", get(list_credential_keys::<S>))
+        .route("/credentials/:key", delete(delete_credential::<S>))
+        .route("/update/check", get(check_update::<S>))
+        .route("/update/apply", post(apply_update::<S>))
+        .route("/channels/whatsapp/qr", get(get_whatsapp_qr::<S>))
+        // WebSocket log streaming
+        .route("/ws/runs/:id/stream", get(log_stream_ws::ws_handler::<S>))
+        // SSE log streaming
+        .route(
+            "/sse/runs/:id/stream",
+            get(log_stream_sse::sse_handler::<S>),
+        )
+        // Webhook
+        .route("/hooks/:name", post(webhook::handle_webhook::<S>))
         .with_state(state)
 }
 
-async fn health(State(state): State<AppState>) -> impl IntoResponse {
-    let uptime = state.start_time.elapsed().as_secs();
+// --- Handlers ---
+
+async fn health<S: Store>(State(state): State<AppState<S>>) -> impl IntoResponse {
+    let uptime = state.meta.start_time.elapsed().as_secs();
     Json(HealthResponse {
-        version: state.version.clone(),
+        version: state.meta.version.clone(),
         uptime_secs: uptime,
         scheduler: "running".to_string(),
         channels: ChannelStatus {
@@ -118,10 +151,11 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
     })
 }
 
-async fn create_automation(
-    State(state): State<AppState>,
+async fn create_automation<S: Store>(
+    State(state): State<AppState<S>>,
     Json(def): Json<AutomationDef>,
 ) -> impl IntoResponse {
+    let store = &state.store;
     if def.name.trim().is_empty() {
         return (
             StatusCode::BAD_REQUEST,
@@ -148,41 +182,47 @@ async fn create_automation(
             .into_response();
     }
 
-    let conn = state.db.lock().await;
-    match db::insert_automation(&conn, &def) {
+    // Check for duplicates before inserting to avoid stringly-typed error matching
+    match store.get_automation(&def.name).await {
+        Ok(Some(_)) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(
+                    serde_json::to_value(ErrorResponse::conflict(format!(
+                        "Automation '{}' already exists",
+                        def.name
+                    )))
+                    .unwrap(),
+                ),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::to_value(ErrorResponse::internal(e.to_string())).unwrap()),
+            )
+                .into_response();
+        }
+        Ok(None) => {}
+    }
+
+    match store.insert_automation(&def).await {
         Ok(()) => (
             StatusCode::CREATED,
             Json(serde_json::to_value(&def).unwrap()),
         )
             .into_response(),
-        Err(e) => {
-            let msg = e.to_string();
-            if msg.contains("UNIQUE constraint") {
-                (
-                    StatusCode::CONFLICT,
-                    Json(
-                        serde_json::to_value(ErrorResponse::conflict(format!(
-                            "Automation '{}' already exists",
-                            def.name
-                        )))
-                        .unwrap(),
-                    ),
-                )
-                    .into_response()
-            } else {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::to_value(ErrorResponse::internal(msg)).unwrap()),
-                )
-                    .into_response()
-            }
-        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::to_value(ErrorResponse::internal(e.to_string())).unwrap()),
+        )
+            .into_response(),
     }
 }
 
-async fn list_automations(State(state): State<AppState>) -> impl IntoResponse {
-    let conn = state.db.lock().await;
-    match db::list_automations(&conn) {
+async fn list_automations<S: Store>(State(state): State<AppState<S>>) -> impl IntoResponse {
+    match state.store.list_automations().await {
         Ok(automations) => Json(automations).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -192,9 +232,11 @@ async fn list_automations(State(state): State<AppState>) -> impl IntoResponse {
     }
 }
 
-async fn trigger_run(State(state): State<AppState>, Path(name): Path<String>) -> impl IntoResponse {
-    let conn = state.db.lock().await;
-    let automation = match db::get_automation(&conn, &name) {
+async fn trigger_run<S: Store>(
+    State(state): State<AppState<S>>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    let automation = match state.store.get_automation(&name).await {
         Ok(Some(a)) => a,
         Ok(None) => {
             return (
@@ -230,16 +272,13 @@ async fn trigger_run(State(state): State<AppState>, Path(name): Path<String>) ->
         error: None,
     };
 
-    if let Err(e) = db::insert_run(&conn, &run) {
+    if let Err(e) = state.store.insert_run(&run).await {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::to_value(ErrorResponse::internal(e.to_string())).unwrap()),
         )
             .into_response();
     }
-
-    // Release the DB lock before sending to channel
-    drop(conn);
 
     let job = Job {
         automation_name: name,
@@ -274,12 +313,11 @@ async fn trigger_run(State(state): State<AppState>, Path(name): Path<String>) ->
         .into_response()
 }
 
-async fn delete_automation(
-    State(state): State<AppState>,
+async fn delete_automation<S: Store>(
+    State(state): State<AppState<S>>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
-    let conn = state.db.lock().await;
-    match db::delete_automation(&conn, &name) {
+    match state.store.delete_automation(&name).await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => (
             StatusCode::NOT_FOUND,
@@ -300,16 +338,15 @@ async fn delete_automation(
     }
 }
 
-async fn list_runs(
-    State(state): State<AppState>,
+async fn list_runs<S: Store>(
+    State(state): State<AppState<S>>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
     let limit = params
         .get("limit")
         .and_then(|v| v.parse::<u32>().ok())
         .unwrap_or(100);
-    let conn = state.db.lock().await;
-    match db::list_runs(&conn, Some(limit)) {
+    match state.store.list_runs(Some(limit)).await {
         Ok(runs) => Json(runs).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -327,10 +364,11 @@ struct SetCredentialRequest {
     value: String,
 }
 
-async fn set_credential(
-    State(state): State<AppState>,
+async fn set_credential<S: Store>(
+    State(state): State<AppState<S>>,
     Json(req): Json<SetCredentialRequest>,
 ) -> impl IntoResponse {
+    let store = &state.store;
     if req.key.trim().is_empty() {
         return (
             StatusCode::BAD_REQUEST,
@@ -344,8 +382,7 @@ async fn set_credential(
             .into_response();
     }
 
-    let conn = state.db.lock().await;
-    match credentials::set_credential(&conn, &req.key, &req.value) {
+    match store.set_credential(&req.key, &req.value).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -355,9 +392,8 @@ async fn set_credential(
     }
 }
 
-async fn list_credential_keys(State(state): State<AppState>) -> impl IntoResponse {
-    let conn = state.db.lock().await;
-    match credentials::list_credential_keys(&conn) {
+async fn list_credential_keys<S: Store>(State(state): State<AppState<S>>) -> impl IntoResponse {
+    match state.store.list_credential_keys().await {
         Ok(keys) => Json(keys).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -367,12 +403,11 @@ async fn list_credential_keys(State(state): State<AppState>) -> impl IntoRespons
     }
 }
 
-async fn delete_credential(
-    State(state): State<AppState>,
+async fn delete_credential<S: Store>(
+    State(state): State<AppState<S>>,
     Path(key): Path<String>,
 ) -> impl IntoResponse {
-    let conn = state.db.lock().await;
-    match credentials::delete_credential(&conn, &key) {
+    match state.store.delete_credential(&key).await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => (
             StatusCode::NOT_FOUND,
@@ -402,8 +437,9 @@ struct UpdateCheckResponse {
     update: Option<updater::UpdateInfo>,
 }
 
-async fn check_update(State(state): State<AppState>) -> impl IntoResponse {
-    match updater::check_for_update(&state.version, &state.github_repo).await {
+async fn check_update<S: Store>(State(state): State<AppState<S>>) -> impl IntoResponse {
+    let meta = &state.meta;
+    match updater::check_for_update(&meta.version, &meta.github_repo).await {
         Ok(Some(info)) => Json(UpdateCheckResponse {
             up_to_date: false,
             update: Some(info),
@@ -428,11 +464,12 @@ struct UpdateApplyResponse {
     version: String,
 }
 
-async fn apply_update(State(state): State<AppState>) -> impl IntoResponse {
-    let info = match updater::check_for_update(&state.version, &state.github_repo).await {
+async fn apply_update<S: Store>(State(state): State<AppState<S>>) -> impl IntoResponse {
+    let meta = &state.meta;
+    let info = match updater::check_for_update(&meta.version, &meta.github_repo).await {
         Ok(Some(info)) => info,
         Ok(None) => {
-            return Json(serde_json::json!({"status": "up_to_date", "version": state.version}))
+            return Json(serde_json::json!({"status": "up_to_date", "version": meta.version}))
                 .into_response();
         }
         Err(e) => {
@@ -499,8 +536,8 @@ struct WhatsAppQrResponse {
     qr: String,
 }
 
-async fn get_whatsapp_qr(State(state): State<AppState>) -> impl IntoResponse {
-    let qr = state.whatsapp_qr.lock().await;
+async fn get_whatsapp_qr<S: Store>(State(state): State<AppState<S>>) -> impl IntoResponse {
+    let qr = state.whatsapp_qr.0.lock().await;
     match qr.as_ref() {
         Some(qr_data) => Json(WhatsAppQrResponse {
             qr: qr_data.clone(),
@@ -508,11 +545,13 @@ async fn get_whatsapp_qr(State(state): State<AppState>) -> impl IntoResponse {
         .into_response(),
         None => (
             StatusCode::NOT_FOUND,
-            Json(serde_json::to_value(ErrorResponse::not_found(
-                "No QR code available. Either already authenticated or not yet started."
-                    .to_string(),
-            ))
-            .unwrap()),
+            Json(
+                serde_json::to_value(ErrorResponse::not_found(
+                    "No QR code available. Either already authenticated or not yet started."
+                        .to_string(),
+                ))
+                .unwrap(),
+            ),
         )
             .into_response(),
     }
@@ -521,23 +560,27 @@ async fn get_whatsapp_qr(State(state): State<AppState>) -> impl IntoResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store_sqlx::SqlxStore;
     use axum::body::Body;
     use axum::http::Request;
     use tower::ServiceExt;
 
-    async fn setup_app() -> Router {
-        let conn = db::init_db_in_memory().unwrap();
-        let db = Arc::new(Mutex::new(conn));
-        let (tx, _rx) = crate::job_queue::create_channel(100);
+    async fn setup_app() -> (Router, crate::job_queue::JobReceiver) {
+        let store = SqlxStore::connect_in_memory().await.unwrap();
+        let (tx, rx) = crate::job_queue::create_channel(100);
         let state = AppState {
-            db,
+            store,
             job_tx: tx,
-            start_time: Instant::now(),
-            version: "0.1.0-test".to_string(),
-            github_repo: "test/repo".to_string(),
-            whatsapp_qr: Arc::new(Mutex::new(None)),
+            meta: DaemonMeta {
+                start_time: Instant::now(),
+                version: "0.1.0-test".to_string(),
+                github_repo: "test/repo".to_string(),
+            },
+            whatsapp_qr: WhatsAppQrState(Arc::new(Mutex::new(None))),
+            log_stream_mgr: Arc::new(LogStreamManager::new()),
+            webhook_entries: Arc::new(Mutex::new(HashMap::new())),
         };
-        create_router(state)
+        (create_router(state), rx)
     }
 
     fn make_automation_json(name: &str) -> String {
@@ -551,7 +594,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_health() {
-        let app = setup_app().await;
+        let (app, _rx) = setup_app().await;
         let resp = app
             .oneshot(
                 Request::builder()
@@ -583,7 +626,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_automation() {
-        let app = setup_app().await;
+        let (app, _rx) = setup_app().await;
         let resp = app
             .oneshot(
                 Request::builder()
@@ -606,18 +649,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_duplicate_automation() {
-        let conn = db::init_db_in_memory().unwrap();
-        let db = Arc::new(Mutex::new(conn));
-        let (tx, _rx) = crate::job_queue::create_channel(100);
-        let state = AppState {
-            db,
-            job_tx: tx,
-            start_time: Instant::now(),
-            version: "0.1.0-test".to_string(),
-            github_repo: "test/repo".to_string(),
-            whatsapp_qr: Arc::new(Mutex::new(None)),
-        };
-        let app = create_router(state);
+        let (app, _rx) = setup_app().await;
 
         // First create
         let resp = app
@@ -651,20 +683,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_automations() {
-        let conn = db::init_db_in_memory().unwrap();
-        let db = Arc::new(Mutex::new(conn));
-        let (tx, _rx) = crate::job_queue::create_channel(100);
-        let state = AppState {
-            db,
-            job_tx: tx,
-            start_time: Instant::now(),
-            version: "0.1.0-test".to_string(),
-            github_repo: "test/repo".to_string(),
-            whatsapp_qr: Arc::new(Mutex::new(None)),
-        };
-        let app = create_router(state);
+        let (app, _rx) = setup_app().await;
 
-        // Create two automations
         for name in ["auto-1", "auto-2"] {
             let _ = app
                 .clone()
@@ -680,7 +700,6 @@ mod tests {
                 .unwrap();
         }
 
-        // List
         let resp = app
             .oneshot(
                 Request::builder()
@@ -700,20 +719,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_delete_automation() {
-        let conn = db::init_db_in_memory().unwrap();
-        let db = Arc::new(Mutex::new(conn));
-        let (tx, _rx) = crate::job_queue::create_channel(100);
-        let state = AppState {
-            db,
-            job_tx: tx,
-            start_time: Instant::now(),
-            version: "0.1.0-test".to_string(),
-            github_repo: "test/repo".to_string(),
-            whatsapp_qr: Arc::new(Mutex::new(None)),
-        };
-        let app = create_router(state);
+        let (app, _rx) = setup_app().await;
 
-        // Create
         let _ = app
             .clone()
             .oneshot(
@@ -727,7 +734,6 @@ mod tests {
             .await
             .unwrap();
 
-        // Delete
         let resp = app
             .clone()
             .oneshot(
@@ -741,7 +747,6 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 
-        // Verify gone
         let resp = app
             .oneshot(
                 Request::builder()
@@ -760,7 +765,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_delete_nonexistent_automation() {
-        let app = setup_app().await;
+        let (app, _rx) = setup_app().await;
         let resp = app
             .oneshot(
                 Request::builder()
@@ -776,7 +781,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_trigger_run_not_found() {
-        let app = setup_app().await;
+        let (app, _rx) = setup_app().await;
         let resp = app
             .oneshot(
                 Request::builder()
@@ -792,20 +797,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_trigger_run_success() {
-        let conn = db::init_db_in_memory().unwrap();
-        let db = Arc::new(Mutex::new(conn));
-        let (tx, _rx) = crate::job_queue::create_channel(100);
-        let state = AppState {
-            db,
-            job_tx: tx,
-            start_time: Instant::now(),
-            version: "0.1.0-test".to_string(),
-            github_repo: "test/repo".to_string(),
-            whatsapp_qr: Arc::new(Mutex::new(None)),
-        };
-        let app = create_router(state);
+        let (app, _rx) = setup_app().await;
 
-        // Create automation first
         let _ = app
             .clone()
             .oneshot(
@@ -819,7 +812,6 @@ mod tests {
             .await
             .unwrap();
 
-        // Trigger run
         let resp = app
             .clone()
             .oneshot(
@@ -839,7 +831,6 @@ mod tests {
         assert!(json["run_id"].is_string());
         assert_eq!(json["status"], "pending");
 
-        // Verify run appears in list
         let resp = app
             .oneshot(Request::builder().uri("/runs").body(Body::empty()).unwrap())
             .await
@@ -854,7 +845,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_runs_empty() {
-        let app = setup_app().await;
+        let (app, _rx) = setup_app().await;
         let resp = app
             .oneshot(Request::builder().uri("/runs").body(Body::empty()).unwrap())
             .await
@@ -869,9 +860,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_set_and_list_credentials() {
-        let app = setup_app().await;
+        let (app, _rx) = setup_app().await;
 
-        // Set a credential
         let resp = app
             .clone()
             .oneshot(
@@ -888,7 +878,6 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 
-        // List keys
         let resp = app
             .clone()
             .oneshot(
@@ -906,7 +895,6 @@ mod tests {
         let keys: Vec<String> = serde_json::from_slice(&body).unwrap();
         assert_eq!(keys, vec!["MY_KEY"]);
 
-        // Delete
         let resp = app
             .clone()
             .oneshot(
@@ -920,7 +908,6 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 
-        // Verify gone
         let resp = app
             .oneshot(
                 Request::builder()
@@ -939,7 +926,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_delete_nonexistent_credential() {
-        let app = setup_app().await;
+        let (app, _rx) = setup_app().await;
         let resp = app
             .oneshot(
                 Request::builder()
@@ -957,9 +944,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_error_codes_on_not_found() {
-        let app = setup_app().await;
+        let (app, _rx) = setup_app().await;
 
-        // Delete nonexistent automation returns NOT_FOUND code
         let resp = app
             .clone()
             .oneshot(
@@ -975,7 +961,6 @@ mod tests {
         let json = get_json(resp).await;
         assert_eq!(json["code"], "NOT_FOUND");
 
-        // Trigger nonexistent automation returns NOT_FOUND code
         let resp = app
             .oneshot(
                 Request::builder()
@@ -993,18 +978,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_error_codes_on_conflict() {
-        let conn = db::init_db_in_memory().unwrap();
-        let db = Arc::new(Mutex::new(conn));
-        let (tx, _rx) = crate::job_queue::create_channel(100);
-        let state = AppState {
-            db,
-            job_tx: tx,
-            start_time: Instant::now(),
-            version: "0.1.0-test".to_string(),
-            github_repo: "test/repo".to_string(),
-            whatsapp_qr: Arc::new(Mutex::new(None)),
-        };
-        let app = create_router(state);
+        let (app, _rx) = setup_app().await;
 
         let _ = app
             .clone()
@@ -1037,7 +1011,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_bad_request_empty_name() {
-        let app = setup_app().await;
+        let (app, _rx) = setup_app().await;
         let body = serde_json::json!({
             "name": "",
             "trigger": "manual",
@@ -1063,7 +1037,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_bad_request_empty_prompt() {
-        let app = setup_app().await;
+        let (app, _rx) = setup_app().await;
         let body = serde_json::json!({
             "name": "test",
             "trigger": "manual",
@@ -1089,7 +1063,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_bad_request_empty_credential_key() {
-        let app = setup_app().await;
+        let (app, _rx) = setup_app().await;
         let resp = app
             .oneshot(
                 Request::builder()

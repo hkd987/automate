@@ -144,32 +144,34 @@ function WhatsAppConfig({ vmId }: { vmId: string | null }) {
   const { execute: fetchDaemonApi } = useTauriCommand<string>('daemon_api_get')
   const [success, setSuccess] = useState(false)
 
+  // Derive idle state from enabled/vmId — no effect needed for reset
+  const isActive = enabled && !!vmId
+
   // Poll for QR code when WhatsApp is enabled
   useEffect(() => {
-    if (!enabled || !vmId) {
-      if (intervalRef.current) {
-        clearInterval(intervalRef.current)
-        intervalRef.current = null
-      }
-      setQrCode(null)
-      setStatus('idle')
+    if (!isActive) {
       return
     }
 
+    let cancelled = false
+
     const poll = async () => {
       try {
-        const resp = await fetchDaemonApi({ path: '/channels/whatsapp/qr', vm_id: vmId })
-        if (resp) {
+        const resp = await fetchDaemonApi({ path: '/channels/whatsapp/qr', vm_id: vmId! })
+        if (!cancelled && resp) {
           const data = JSON.parse(resp)
           setQrCode(data.qr)
           setStatus('waiting_qr')
         }
       } catch {
-        // 404 means no QR available (already authenticated or not started)
-        if (qrCode) {
-          // Had QR before, now gone = connected
-          setQrCode(null)
-          setStatus('connected')
+        if (!cancelled) {
+          // 404 means no QR available (already authenticated or not started)
+          setQrCode(prev => {
+            if (prev) {
+              setStatus('connected')
+            }
+            return null
+          })
         }
       }
     }
@@ -178,12 +180,15 @@ function WhatsAppConfig({ vmId }: { vmId: string | null }) {
     intervalRef.current = setInterval(poll, 2000)
 
     return () => {
+      cancelled = true
       if (intervalRef.current) {
         clearInterval(intervalRef.current)
         intervalRef.current = null
       }
+      setQrCode(null)
+      setStatus('idle')
     }
-  }, [enabled, vmId])
+  }, [isActive, vmId, fetchDaemonApi])
 
   const handleSave = async () => {
     setSuccess(false)

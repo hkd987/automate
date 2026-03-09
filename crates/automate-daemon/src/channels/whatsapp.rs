@@ -478,7 +478,8 @@ mod tests {
 
     #[test]
     fn test_parse_bridge_event_message() {
-        let json = r#"{"type":"message","from":"15551234567@c.us","body":"hello","timestamp":1700000000}"#;
+        let json =
+            r#"{"type":"message","from":"15551234567@c.us","body":"hello","timestamp":1700000000}"#;
         let event: BridgeEvent = serde_json::from_str(json).unwrap();
         match event {
             BridgeEvent::Message {

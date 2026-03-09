@@ -82,12 +82,7 @@ pub async fn test_connection(
     user: String,
     key_path: String,
 ) -> Result<String, String> {
-    let ssh = crate::ssh::SshConnection::new(
-        host,
-        port,
-        user,
-        std::path::PathBuf::from(key_path),
-    );
+    let ssh = crate::ssh::SshConnection::new(host, port, user, std::path::PathBuf::from(key_path));
     ssh.connect().await.map_err(|e| e.to_string())?;
     let arch = ssh.detect_arch().await.map_err(|e| e.to_string())?;
     Ok(arch)

@@ -1,39 +1,27 @@
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use axum::{
     body::Bytes,
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
-    routing::post,
-    Json, Router,
+    Json,
 };
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
-use tokio::sync::Mutex;
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::job_queue::{Job, JobSender};
+use automate_shared::store::Store;
+
+use crate::api::AppState;
+use crate::job_queue::Job;
 
 type HmacSha256 = Hmac<Sha256>;
 
 pub struct WebhookEntry {
     pub secret: String,
     pub prompt: String,
-}
-
-#[derive(Clone)]
-pub struct WebhookState {
-    pub entries: Arc<Mutex<HashMap<String, WebhookEntry>>>,
-    pub job_tx: JobSender,
-}
-
-pub fn create_webhook_router(state: WebhookState) -> Router {
-    Router::new()
-        .route("/hooks/:name", post(handle_webhook))
-        .with_state(state)
 }
 
 pub fn verify_hmac(secret: &str, body: &[u8], signature_hex: &str) -> bool {
@@ -47,14 +35,14 @@ pub fn verify_hmac(secret: &str, body: &[u8], signature_hex: &str) -> bool {
     mac.verify_slice(&expected).is_ok()
 }
 
-async fn handle_webhook(
-    State(state): State<WebhookState>,
+pub async fn handle_webhook<S: Store>(
+    State(state): State<AppState<S>>,
     Path(name): Path<String>,
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
-    let entries = state.entries.lock().await;
-    let entry = match entries.get(&name) {
+    let entries_lock = state.webhook_entries.lock().await;
+    let entry = match entries_lock.get(&name) {
         Some(e) => WebhookEntry {
             secret: e.secret.clone(),
             prompt: e.prompt.clone(),
@@ -67,7 +55,7 @@ async fn handle_webhook(
                 .into_response();
         }
     };
-    drop(entries);
+    drop(entries_lock);
 
     // Validate HMAC signature
     let signature = match headers.get("X-Signature-256") {
@@ -138,8 +126,16 @@ async fn handle_webhook(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::{AppState, DaemonMeta, WhatsAppQrState};
+    use crate::log_stream::LogStreamManager;
+    use crate::store_sqlx::SqlxStore;
     use axum::body::Body;
     use axum::http::Request;
+    use axum::routing::post;
+    use axum::Router;
+    use std::sync::Arc;
+    use std::time::Instant;
+    use tokio::sync::Mutex;
     use tower::ServiceExt;
 
     fn make_signature(secret: &str, body: &[u8]) -> String {
@@ -149,7 +145,11 @@ mod tests {
         hex::encode(result.into_bytes())
     }
 
-    fn setup_webhook_app(name: &str, secret: &str, prompt: &str) -> Router {
+    async fn setup_webhook_app(
+        name: &str,
+        secret: &str,
+        prompt: &str,
+    ) -> (Router, crate::job_queue::JobReceiver) {
         let mut entries = HashMap::new();
         entries.insert(
             name.to_string(),
@@ -159,31 +159,30 @@ mod tests {
             },
         );
 
-        let (tx, _rx) = crate::job_queue::create_channel(10);
-        let state = WebhookState {
-            entries: Arc::new(Mutex::new(entries)),
+        let store = SqlxStore::connect_in_memory().await.unwrap();
+        let (tx, rx) = crate::job_queue::create_channel(10);
+        let state = AppState {
+            store,
             job_tx: tx,
+            meta: DaemonMeta {
+                start_time: Instant::now(),
+                version: "test".to_string(),
+                github_repo: "test/repo".to_string(),
+            },
+            whatsapp_qr: WhatsAppQrState(Arc::new(Mutex::new(None))),
+            log_stream_mgr: Arc::new(LogStreamManager::new()),
+            webhook_entries: Arc::new(Mutex::new(entries)),
         };
-        create_webhook_router(state)
+        let app = Router::new()
+            .route("/hooks/:name", post(handle_webhook::<SqlxStore>))
+            .with_state(state);
+        (app, rx)
     }
 
     #[tokio::test]
     async fn test_valid_hmac_enqueues_job() {
-        let (tx, mut rx) = crate::job_queue::create_channel(10);
-        let mut entries = HashMap::new();
-        entries.insert(
-            "test-hook".to_string(),
-            WebhookEntry {
-                secret: "my-secret".to_string(),
-                prompt: "Process: $WEBHOOK_BODY".to_string(),
-            },
-        );
-
-        let state = WebhookState {
-            entries: Arc::new(Mutex::new(entries)),
-            job_tx: tx,
-        };
-        let app = create_webhook_router(state);
+        let (app, mut rx) =
+            setup_webhook_app("test-hook", "my-secret", "Process: $WEBHOOK_BODY").await;
 
         let body = b"hello webhook";
         let sig = make_signature("my-secret", body);
@@ -216,7 +215,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_invalid_hmac_returns_401() {
-        let app = setup_webhook_app("test-hook", "my-secret", "prompt");
+        let (app, _rx) = setup_webhook_app("test-hook", "my-secret", "prompt").await;
 
         let body = b"hello webhook";
         let bad_sig = "deadbeef";
@@ -238,7 +237,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_missing_signature_returns_401() {
-        let app = setup_webhook_app("test-hook", "my-secret", "prompt");
+        let (app, _rx) = setup_webhook_app("test-hook", "my-secret", "prompt").await;
 
         let resp = app
             .oneshot(
@@ -256,7 +255,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_unknown_webhook_returns_404() {
-        let app = setup_webhook_app("test-hook", "my-secret", "prompt");
+        let (app, _rx) = setup_webhook_app("test-hook", "my-secret", "prompt").await;
 
         let resp = app
             .oneshot(
@@ -275,21 +274,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_webhook_body_interpolation() {
-        let (tx, mut rx) = crate::job_queue::create_channel(10);
-        let mut entries = HashMap::new();
-        entries.insert(
-            "interp".to_string(),
-            WebhookEntry {
-                secret: "secret".to_string(),
-                prompt: "Handle event: $WEBHOOK_BODY done".to_string(),
-            },
-        );
-
-        let state = WebhookState {
-            entries: Arc::new(Mutex::new(entries)),
-            job_tx: tx,
-        };
-        let app = create_webhook_router(state);
+        let (app, mut rx) =
+            setup_webhook_app("interp", "secret", "Handle event: $WEBHOOK_BODY done").await;
 
         let body = b"{\"event\":\"push\"}";
         let sig = make_signature("secret", body);

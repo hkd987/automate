@@ -7,17 +7,17 @@ use axum::{
     routing::{delete, get, post},
     Json, Router,
 };
-use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
+
+use automate_shared::store::Store;
 
 use crate::config_watcher::ConfigWatcher;
 use crate::job_queue::JobSender;
 use crate::scheduler::Scheduler;
 
 #[derive(Clone)]
-pub struct ConfigWatchAppState {
-    pub db: Arc<Mutex<Connection>>,
+pub struct ConfigWatchAppState<S: Store> {
+    pub store: S,
     pub job_tx: JobSender,
     pub scheduler: Arc<Scheduler>,
     pub watcher: Arc<ConfigWatcher>,
@@ -35,16 +35,16 @@ struct WatchStatusResponse {
     last_reload: Option<String>,
 }
 
-pub fn create_config_watch_router(state: ConfigWatchAppState) -> Router {
+pub fn create_config_watch_router<S: Store>(state: ConfigWatchAppState<S>) -> Router {
     Router::new()
-        .route("/config/watch", post(start_watch))
-        .route("/config/watch", delete(stop_watch))
-        .route("/config/watch", get(watch_status))
+        .route("/config/watch", post(start_watch::<S>))
+        .route("/config/watch", delete(stop_watch::<S>))
+        .route("/config/watch", get(watch_status::<S>))
         .with_state(state)
 }
 
-async fn start_watch(
-    State(state): State<ConfigWatchAppState>,
+async fn start_watch<S: Store>(
+    State(state): State<ConfigWatchAppState<S>>,
     Json(req): Json<WatchRequest>,
 ) -> impl IntoResponse {
     let path = std::path::PathBuf::from(&req.path);
@@ -58,12 +58,7 @@ async fn start_watch(
 
     match state
         .watcher
-        .start_watching(
-            path,
-            state.db.clone(),
-            state.job_tx.clone(),
-            state.scheduler.clone(),
-        )
+        .start_watching(path, state.store, state.job_tx, state.scheduler)
         .await
     {
         Ok(()) => (
@@ -79,7 +74,7 @@ async fn start_watch(
     }
 }
 
-async fn stop_watch(State(state): State<ConfigWatchAppState>) -> impl IntoResponse {
+async fn stop_watch<S: Store>(State(state): State<ConfigWatchAppState<S>>) -> impl IntoResponse {
     state.watcher.stop_watching().await;
     (
         StatusCode::OK,
@@ -87,7 +82,7 @@ async fn stop_watch(State(state): State<ConfigWatchAppState>) -> impl IntoRespon
     )
 }
 
-async fn watch_status(State(state): State<ConfigWatchAppState>) -> impl IntoResponse {
+async fn watch_status<S: Store>(State(state): State<ConfigWatchAppState<S>>) -> impl IntoResponse {
     let (active, path, last_reload) = state.watcher.get_state().await;
     Json(WatchStatusResponse {
         active,
@@ -99,26 +94,24 @@ async fn watch_status(State(state): State<ConfigWatchAppState>) -> impl IntoResp
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db;
+    use crate::store_sqlx::SqlxStore;
     use axum::body::Body;
     use axum::http::Request;
     use tower::ServiceExt;
 
-    async fn setup_app(dir_path: Option<&std::path::Path>) -> (Router, Arc<ConfigWatcher>) {
-        let conn = db::init_db_in_memory().unwrap();
-        let db = Arc::new(Mutex::new(conn));
+    async fn setup_app(_dir_path: Option<&std::path::Path>) -> (Router, Arc<ConfigWatcher>) {
+        let store = SqlxStore::connect_in_memory().await.unwrap();
         let (tx, _rx) = crate::job_queue::create_channel(100);
         let scheduler = Arc::new(Scheduler::new().await.unwrap());
         let watcher = Arc::new(ConfigWatcher::new());
 
         let state = ConfigWatchAppState {
-            db,
+            store,
             job_tx: tx,
             scheduler,
             watcher: watcher.clone(),
         };
 
-        let _ = dir_path;
         (create_config_watch_router(state), watcher)
     }
 
@@ -169,14 +162,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(".automate.yml"), "automations: []\n").unwrap();
 
-        let conn = db::init_db_in_memory().unwrap();
-        let db = Arc::new(Mutex::new(conn));
+        let store = SqlxStore::connect_in_memory().await.unwrap();
         let (tx, _rx) = crate::job_queue::create_channel(100);
         let scheduler = Arc::new(Scheduler::new().await.unwrap());
         let watcher = Arc::new(ConfigWatcher::new());
 
         let state = ConfigWatchAppState {
-            db,
+            store,
             job_tx: tx,
             scheduler,
             watcher: watcher.clone(),

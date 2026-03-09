@@ -1,15 +1,15 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
 
 use clap::Parser;
 use tokio::sync::Mutex;
 use tracing::info;
 
 use automate_daemon::{
-    agent, api, channels, db, job_queue, log_stream, log_stream_ws, log_watcher, scheduler,
+    agent, api, channels, job_queue, log_stream, log_watcher, scheduler, store_sqlx::SqlxStore,
     updater, webhook,
 };
+use automate_shared::store::Store;
 use automate_shared::triggers::TriggerDef;
 
 const GITHUB_REPO: &str = "lumatthews/automate";
@@ -63,17 +63,26 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let db_path = cli.db_path.unwrap_or_else(|| {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        let dir = std::path::Path::new(&home).join(".automate");
-        std::fs::create_dir_all(&dir).ok();
-        dir.join("config.db").to_string_lossy().to_string()
-    });
+    let db_url = cli.db_path.map_or_else(
+        || {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+            let dir = std::path::Path::new(&home).join(".automate");
+            std::fs::create_dir_all(&dir).ok();
+            let db_file = dir.join("config.db").to_string_lossy().to_string();
+            format!("sqlite://{}", db_file)
+        },
+        |path| {
+            if path.starts_with("postgres://") || path.starts_with("sqlite://") {
+                path
+            } else {
+                format!("sqlite://{}", path)
+            }
+        },
+    );
 
-    info!(version = VERSION, db_path = %db_path, "Starting automate-daemon");
+    info!(version = VERSION, db_url = %db_url, "Starting automate-daemon");
 
-    let conn = db::init_db(&db_path)?;
-    let db = Arc::new(Mutex::new(conn));
+    let store = SqlxStore::connect(&db_url).await?;
 
     let (job_tx, job_rx) = job_queue::create_channel(100);
 
@@ -84,13 +93,13 @@ async fn main() -> anyhow::Result<()> {
     // Initialize log stream manager for real-time log streaming
     let log_stream_mgr = Arc::new(log_stream::LogStreamManager::new());
 
-    let consumer_db = db.clone();
+    let consumer_store = store.clone();
     let consumer_runtime = runtime.clone();
     let consumer_log_stream = log_stream_mgr.clone();
     tokio::spawn(async move {
         job_queue::run_consumer_with_log_stream(
             job_rx,
-            consumer_db,
+            consumer_store,
             consumer_runtime,
             consumer_log_stream,
         )
@@ -98,10 +107,7 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // Load all automations once from DB for startup initialization
-    let automations = {
-        let conn = db.lock().await;
-        db::list_automations(&conn)?
-    };
+    let automations = store.list_automations().await?;
 
     // Initialize scheduler and restore cron jobs
     let sched = scheduler::Scheduler::new().await?;
@@ -124,14 +130,13 @@ async fn main() -> anyhow::Result<()> {
 
     // Initialize webhook state from DB
     let webhook_entries = {
-        let conn = db.lock().await;
         let mut entries = HashMap::new();
         for a in &automations {
             if a.trigger == TriggerDef::Webhook {
-                if let Ok(Some(secret)) = automate_daemon::credentials::get_credential(
-                    &conn,
-                    &format!("{}.webhook_secret", a.name),
-                ) {
+                if let Ok(Some(secret)) = store
+                    .get_credential(&format!("{}.webhook_secret", a.name))
+                    .await
+                {
                     entries.insert(
                         a.name.clone(),
                         webhook::WebhookEntry {
@@ -145,17 +150,11 @@ async fn main() -> anyhow::Result<()> {
         entries
     };
 
-    let webhook_state = webhook::WebhookState {
-        entries: Arc::new(Mutex::new(webhook_entries)),
-        job_tx: job_tx.clone(),
-    };
-
     // Initialize log watcher manager
     let log_watcher_mgr = Arc::new(log_watcher::LogWatcherManager::new());
     {
         for a in &automations {
             if let TriggerDef::LogPattern(pattern) = &a.trigger {
-                // Log watchers need a file path
                 if let Some(file) = &a.file {
                     if let Err(e) = log_watcher_mgr
                         .register_watcher(
@@ -183,15 +182,15 @@ async fn main() -> anyhow::Result<()> {
 
     // Load Slack config from credentials if available
     {
-        let conn = db.lock().await;
         if let (Ok(Some(bot_token)), Ok(Some(app_token))) = (
-            automate_daemon::credentials::get_credential(&conn, "SLACK_BOT_TOKEN"),
-            automate_daemon::credentials::get_credential(&conn, "SLACK_APP_TOKEN"),
+            store.get_credential("SLACK_BOT_TOKEN").await,
+            store.get_credential("SLACK_APP_TOKEN").await,
         ) {
-            let allowed_str =
-                automate_daemon::credentials::get_credential(&conn, "SLACK_ALLOWED_USER_IDS")
-                    .unwrap_or(None)
-                    .unwrap_or_default();
+            let allowed_str = store
+                .get_credential("SLACK_ALLOWED_USER_IDS")
+                .await
+                .unwrap_or(None)
+                .unwrap_or_default();
             let allowed_user_ids: Vec<String> = allowed_str
                 .split(',')
                 .map(|s| s.trim().to_string())
@@ -208,19 +207,19 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let state = api::AppState {
-        db,
+        store,
         job_tx,
-        start_time: Instant::now(),
-        version: VERSION.to_string(),
-        github_repo: GITHUB_REPO.to_string(),
-        whatsapp_qr: Arc::new(Mutex::new(None)),
+        meta: api::DaemonMeta {
+            start_time: std::time::Instant::now(),
+            version: VERSION.to_string(),
+            github_repo: GITHUB_REPO.to_string(),
+        },
+        whatsapp_qr: api::WhatsAppQrState(Arc::new(Mutex::new(None))),
+        log_stream_mgr,
+        webhook_entries: Arc::new(Mutex::new(webhook_entries)),
     };
 
-    let ws_state = log_stream_ws::WsState { log_stream_mgr };
-
-    let app = api::create_router(state)
-        .merge(webhook::create_webhook_router(webhook_state))
-        .merge(log_stream_ws::create_ws_router(ws_state));
+    let app = api::create_router(state);
 
     let addr = format!("{}:{}", cli.host, cli.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;

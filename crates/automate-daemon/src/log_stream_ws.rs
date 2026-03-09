@@ -6,39 +6,30 @@ use axum::{
         Path, State, WebSocketUpgrade,
     },
     response::IntoResponse,
-    routing::get,
-    Router,
 };
 use futures_util::{SinkExt, StreamExt};
 use tracing::{info, warn};
 
+use automate_shared::store::Store;
+
+use crate::api::AppState;
 use crate::log_stream::LogStreamManager;
 
-#[derive(Clone)]
-pub struct WsState {
-    pub log_stream_mgr: Arc<LogStreamManager>,
-}
-
-pub fn create_ws_router(state: WsState) -> Router {
-    Router::new()
-        .route("/ws/runs/:id/stream", get(ws_handler))
-        .with_state(state)
-}
-
-async fn ws_handler(
+pub async fn ws_handler<S: Store>(
     ws: WebSocketUpgrade,
     Path(run_id): Path<String>,
-    State(state): State<WsState>,
+    State(state): State<AppState<S>>,
 ) -> impl IntoResponse {
     info!(run_id = %run_id, "WebSocket upgrade request for run log stream");
-    ws.on_upgrade(move |socket| handle_socket(socket, run_id, state))
+    let mgr = state.log_stream_mgr;
+    ws.on_upgrade(move |socket| handle_socket(socket, run_id, mgr))
 }
 
-async fn handle_socket(socket: WebSocket, run_id: String, state: WsState) {
+async fn handle_socket(socket: WebSocket, run_id: String, mgr: Arc<LogStreamManager>) {
     let (mut sender, mut receiver) = socket.split();
 
     // Try to subscribe to the stream
-    let subscription = state.log_stream_mgr.subscribe(&run_id).await;
+    let subscription = mgr.subscribe(&run_id).await;
 
     match subscription {
         Some((history, mut rx)) => {

@@ -1,58 +1,10 @@
 use std::collections::HashMap;
 
-use aes_gcm::aead::{Aead, KeyInit, OsRng};
-use aes_gcm::{Aes256Gcm, Nonce};
-use anyhow::{Context, Result};
-use rand::RngCore;
+use anyhow::Result;
 use rusqlite::{params, Connection};
-use sha2::Digest;
 use tracing::warn;
 
-fn derive_key() -> [u8; 32] {
-    if let Ok(key_str) = std::env::var("AUTOMATE_ENCRYPTION_KEY") {
-        let mut hasher = sha2::Sha256::new();
-        hasher.update(key_str.as_bytes());
-        hasher.finalize().into()
-    } else {
-        // Fallback: derive from hostname + username for dev
-        let hostname = hostname::get()
-            .map(|h| h.to_string_lossy().to_string())
-            .unwrap_or_else(|_| "localhost".to_string());
-        let username = std::env::var("USER")
-            .or_else(|_| std::env::var("USERNAME"))
-            .unwrap_or_else(|_| "default".to_string());
-        let mut hasher = sha2::Sha256::new();
-        hasher.update(format!("automate:{}:{}", hostname, username).as_bytes());
-        hasher.finalize().into()
-    }
-}
-
-fn encrypt(data: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
-    let key = derive_key();
-    let cipher = Aes256Gcm::new_from_slice(&key).context("invalid key length")?;
-
-    let mut nonce_bytes = [0u8; 12];
-    OsRng.fill_bytes(&mut nonce_bytes);
-    let nonce = Nonce::from_slice(&nonce_bytes);
-
-    let ciphertext = cipher
-        .encrypt(nonce, data)
-        .map_err(|e| anyhow::anyhow!("encryption failed: {}", e))?;
-
-    Ok((ciphertext, nonce_bytes.to_vec()))
-}
-
-fn decrypt(ciphertext: &[u8], nonce_bytes: &[u8]) -> Result<Vec<u8>> {
-    let key = derive_key();
-    let cipher = Aes256Gcm::new_from_slice(&key).context("invalid key length")?;
-
-    let nonce = Nonce::from_slice(nonce_bytes);
-    let plaintext = cipher
-        .decrypt(nonce, ciphertext)
-        .map_err(|e| anyhow::anyhow!("decryption failed: {}", e))?;
-
-    Ok(plaintext)
-}
+use crate::credentials_crypto::{decrypt, encrypt};
 
 pub fn set_credential(conn: &Connection, key: &str, value: &str) -> Result<()> {
     let (encrypted, nonce) = encrypt(value.as_bytes())?;

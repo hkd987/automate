@@ -53,7 +53,8 @@ impl DaemonClient {
     }
 
     pub async fn list_automations(&self) -> Result<Vec<AutomationDef>, String> {
-        let resp = self.http
+        let resp = self
+            .http
             .get(format!("{}/automations", self.base_url()))
             .send()
             .await
@@ -63,11 +64,14 @@ impl DaemonClient {
             return Err(format!("daemon returned status {}", resp.status()));
         }
 
-        resp.json().await.map_err(|e| format!("failed to parse response: {}", e))
+        resp.json()
+            .await
+            .map_err(|e| format!("failed to parse response: {}", e))
     }
 
     pub async fn create_automation(&self, automation: &AutomationDef) -> Result<(), String> {
-        let resp = self.http
+        let resp = self
+            .http
             .post(format!("{}/automations", self.base_url()))
             .json(automation)
             .send()
@@ -83,7 +87,8 @@ impl DaemonClient {
     }
 
     pub async fn delete_automation(&self, name: &str) -> Result<(), String> {
-        let resp = self.http
+        let resp = self
+            .http
             .delete(format!("{}/automations/{}", self.base_url(), name))
             .send()
             .await
@@ -98,7 +103,8 @@ impl DaemonClient {
     }
 
     pub async fn trigger_run(&self, name: &str) -> Result<String, String> {
-        let resp = self.http
+        let resp = self
+            .http
             .post(format!("{}/automations/{}/run", self.base_url(), name))
             .send()
             .await
@@ -128,7 +134,8 @@ impl DaemonClient {
             url = format!("{}?limit={}", url, limit);
         }
 
-        let resp = self.http
+        let resp = self
+            .http
             .get(&url)
             .send()
             .await
@@ -138,11 +145,14 @@ impl DaemonClient {
             return Err(format!("daemon returned status {}", resp.status()));
         }
 
-        resp.json().await.map_err(|e| format!("failed to parse response: {}", e))
+        resp.json()
+            .await
+            .map_err(|e| format!("failed to parse response: {}", e))
     }
 
     pub async fn get_run(&self, run_id: &str) -> Result<Option<RunRecord>, String> {
-        let resp = self.http
+        let resp = self
+            .http
             .get(format!("{}/runs/{}", self.base_url(), run_id))
             .send()
             .await
@@ -165,7 +175,8 @@ impl DaemonClient {
     }
 
     pub async fn push_credential(&self, key: &str, value: &str) -> Result<(), String> {
-        let resp = self.http
+        let resp = self
+            .http
             .post(format!("{}/credentials", self.base_url()))
             .json(&serde_json::json!({ "key": key, "value": value }))
             .send()
@@ -198,10 +209,11 @@ impl DaemonClient {
     }
 
     pub async fn configure_channel(&self, config_json: &str) -> Result<(), String> {
-        let body: serde_json::Value = serde_json::from_str(config_json)
-            .map_err(|e| format!("invalid JSON: {}", e))?;
+        let body: serde_json::Value =
+            serde_json::from_str(config_json).map_err(|e| format!("invalid JSON: {}", e))?;
 
-        let resp = self.http
+        let resp = self
+            .http
             .post(format!("{}/channels", self.base_url()))
             .json(&body)
             .send()
@@ -218,9 +230,10 @@ impl DaemonClient {
 }
 
 fn find_free_port() -> Result<u16, String> {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .map_err(|e| format!("failed to find free port: {}", e))?;
-    let port = listener.local_addr()
+    let listener =
+        TcpListener::bind("127.0.0.1:0").map_err(|e| format!("failed to find free port: {}", e))?;
+    let port = listener
+        .local_addr()
         .map_err(|e| format!("failed to get local address: {}", e))?
         .port();
     Ok(port)

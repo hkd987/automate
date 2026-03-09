@@ -24,7 +24,7 @@ thiserror = "1"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-axum = { version = "0.7", features = ["ws", "macros"] }
+axum = { version = "0.8", features = ["ws", "macros"] }
 async-trait = "0.1"
 async-stream = "0.3"
 tower = { version = "0.5", features = ["util"] }

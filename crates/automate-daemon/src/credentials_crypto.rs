@@ -1,10 +1,12 @@
+use std::sync::OnceLock;
+
 use aes_gcm::aead::{Aead, KeyInit, OsRng};
 use aes_gcm::{Aes256Gcm, Nonce};
 use anyhow::{Context, Result};
 use rand::RngCore;
 use sha2::Digest;
 
-pub fn derive_key() -> [u8; 32] {
+fn derive_key_inner() -> [u8; 32] {
     if let Ok(key_str) = std::env::var("AUTOMATE_ENCRYPTION_KEY") {
         let mut hasher = sha2::Sha256::new();
         hasher.update(key_str.as_bytes());
@@ -23,9 +25,14 @@ pub fn derive_key() -> [u8; 32] {
     }
 }
 
+fn derive_key() -> &'static [u8; 32] {
+    static KEY: OnceLock<[u8; 32]> = OnceLock::new();
+    KEY.get_or_init(derive_key_inner)
+}
+
 pub fn encrypt(data: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
     let key = derive_key();
-    let cipher = Aes256Gcm::new_from_slice(&key).context("invalid key length")?;
+    let cipher = Aes256Gcm::new_from_slice(key).context("invalid key length")?;
 
     let mut nonce_bytes = [0u8; 12];
     OsRng.fill_bytes(&mut nonce_bytes);
@@ -40,7 +47,7 @@ pub fn encrypt(data: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
 
 pub fn decrypt(ciphertext: &[u8], nonce_bytes: &[u8]) -> Result<Vec<u8>> {
     let key = derive_key();
-    let cipher = Aes256Gcm::new_from_slice(&key).context("invalid key length")?;
+    let cipher = Aes256Gcm::new_from_slice(key).context("invalid key length")?;
 
     let nonce = Nonce::from_slice(nonce_bytes);
     let plaintext = cipher

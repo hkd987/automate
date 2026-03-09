@@ -99,6 +99,27 @@ impl LogStreamManager {
     }
 }
 
+/// Result of subscribing to a run's log stream.
+pub enum StreamSubscription {
+    /// Active stream with historical lines and a live receiver.
+    Active {
+        history: Vec<LogLine>,
+        receiver: broadcast::Receiver<LogLine>,
+    },
+    /// No active stream exists for this run.
+    NotFound,
+}
+
+impl LogStreamManager {
+    /// Subscribe and return a structured result for use by SSE/WS handlers.
+    pub async fn subscribe_or_not_found(&self, run_id: &str) -> StreamSubscription {
+        match self.subscribe(run_id).await {
+            Some((history, receiver)) => StreamSubscription::Active { history, receiver },
+            None => StreamSubscription::NotFound,
+        }
+    }
+}
+
 impl Default for LogStreamManager {
     fn default() -> Self {
         Self::new()
@@ -170,7 +191,7 @@ mod tests {
     async fn test_close_stream() {
         let mgr = LogStreamManager::new();
         let broadcaster = mgr.create_stream("run-4").await;
-        let mut rx = broadcaster.subscribe();
+        let _rx = broadcaster.subscribe();
 
         mgr.close_stream("run-4").await;
 

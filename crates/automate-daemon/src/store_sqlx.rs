@@ -1,9 +1,10 @@
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
 use sqlx::any::{AnyPoolOptions, AnyQueryResult, AnyRow};
-use sqlx::{AnyPool, Row};
+use sqlx::{Acquire, AnyPool, Row};
 use tracing::warn;
 use uuid::Uuid;
 
@@ -13,6 +14,13 @@ use automate_shared::store::Store;
 
 use crate::credentials_crypto::{decrypt, encrypt};
 
+fn install_drivers() {
+    static ONCE: OnceLock<()> = OnceLock::new();
+    ONCE.get_or_init(|| {
+        sqlx::any::install_default_drivers();
+    });
+}
+
 #[derive(Clone)]
 pub struct SqlxStore {
     pool: AnyPool,
@@ -20,7 +28,7 @@ pub struct SqlxStore {
 
 impl SqlxStore {
     pub async fn connect(url: &str) -> Result<Self> {
-        sqlx::any::install_default_drivers();
+        install_drivers();
         let pool = AnyPoolOptions::new()
             .max_connections(5)
             .connect(url)
@@ -32,7 +40,7 @@ impl SqlxStore {
     }
 
     pub async fn connect_in_memory() -> Result<Self> {
-        sqlx::any::install_default_drivers();
+        install_drivers();
         // SQLite in-memory databases are per-connection, so we must limit to 1
         // connection to keep the schema visible across all queries.
         let pool = AnyPoolOptions::new()
@@ -253,18 +261,20 @@ impl Store for SqlxStore {
 
     async fn set_credential(&self, key: &str, value: &str) -> Result<()> {
         let (encrypted, nonce) = encrypt(value.as_bytes())?;
-        // DELETE + INSERT works for both SQLite and Postgres (unlike INSERT OR REPLACE)
-        let _: Option<AnyQueryResult> = sqlx::query("DELETE FROM credentials WHERE key=$1")
+        // DELETE + INSERT in a transaction for atomicity (works for both SQLite and Postgres)
+        let mut conn = self.pool.acquire().await?;
+        let mut tx = conn.begin().await?;
+        sqlx::query("DELETE FROM credentials WHERE key=$1")
             .bind(key)
-            .execute(&self.pool)
-            .await
-            .ok();
+            .execute(&mut *tx)
+            .await?;
         sqlx::query("INSERT INTO credentials (key, encrypted_value, nonce) VALUES ($1, $2, $3)")
             .bind(key)
             .bind(&encrypted)
             .bind(&nonce)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
+        tx.commit().await?;
         Ok(())
     }
 

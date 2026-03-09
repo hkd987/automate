@@ -183,7 +183,7 @@ async fn reload_config<S: Store>(
     job_tx: &JobSender,
     scheduler: &Arc<Scheduler>,
 ) -> anyhow::Result<()> {
-    let content = std::fs::read_to_string(config_path)?;
+    let content = tokio::fs::read_to_string(config_path).await?;
     let new_config: AutomateConfig = serde_yaml::from_str(&content)?;
 
     let current = store.list_automations().await?;

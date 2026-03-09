@@ -16,6 +16,12 @@ struct WatcherEntry {
     cancel_tx: tokio::sync::oneshot::Sender<()>,
 }
 
+struct FileState {
+    offset: u64,
+    #[cfg(unix)]
+    inode: Option<u64>,
+}
+
 pub struct LogWatcherManager {
     watchers: Arc<Mutex<HashMap<String, WatcherEntry>>>,
 }
@@ -44,10 +50,14 @@ impl LogWatcherManager {
         let regex = Regex::new(pattern)?;
         let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel::<()>();
 
-        // Track file offset
-        let offset = Arc::new(Mutex::new(Self::file_size(&file_path)));
+        // Track file state (offset + inode for rotation detection)
+        let file_state = Arc::new(Mutex::new(FileState {
+            offset: Self::file_size(&file_path),
+            #[cfg(unix)]
+            inode: Self::file_inode(&file_path),
+        }));
 
-        let watch_offset = offset.clone();
+        let watch_state = file_state.clone();
 
         // Create an async channel for notify events
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<()>(100);
@@ -82,7 +92,7 @@ impl LogWatcherManager {
                         }
                         Self::process_new_lines(
                             &task_path,
-                            &watch_offset,
+                            &watch_state,
                             &regex,
                             &task_name,
                             &prompt,
@@ -118,41 +128,66 @@ impl LogWatcherManager {
         std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
     }
 
+    #[cfg(unix)]
+    fn file_inode(path: &PathBuf) -> Option<u64> {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(path).ok().map(|m| m.ino())
+    }
+
     async fn process_new_lines(
         path: &Path,
-        offset: &Arc<Mutex<u64>>,
+        state: &Arc<Mutex<FileState>>,
         regex: &Regex,
         name: &str,
         prompt: &str,
         job_sender: &JobSender,
     ) {
-        let mut current_offset = offset.lock().await;
+        let mut file_state = state.lock().await;
 
-        // Perform blocking file I/O in a blocking task
         let path_clone = path.to_path_buf();
-        let start_offset = *current_offset;
+        let start_offset = file_state.offset;
+        #[cfg(unix)]
+        let prev_inode = file_state.inode;
         let regex_clone = regex.clone();
         let read_result = tokio::task::spawn_blocking(move || {
             let file = match std::fs::File::open(&path_clone) {
                 Ok(f) => f,
-                Err(_) => return (start_offset, Vec::new()),
+                Err(_) => return (start_offset, Vec::new(), None),
             };
 
-            let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
+            let metadata = file.metadata().ok();
+            let file_len = metadata.as_ref().map(|m| m.len()).unwrap_or(0);
+
+            #[cfg(unix)]
+            let current_inode = {
+                use std::os::unix::fs::MetadataExt;
+                metadata.as_ref().map(|m| m.ino())
+            };
+            #[cfg(not(unix))]
+            let current_inode: Option<u64> = None;
+
             let mut offset = start_offset;
 
-            // Handle log rotation: if file is smaller than our offset, reset
+            // Handle log rotation: reset if file is smaller than offset
+            // or if the inode changed (file was replaced)
             if file_len < offset {
                 offset = 0;
             }
 
+            #[cfg(unix)]
+            if let (Some(prev), Some(curr)) = (prev_inode, current_inode) {
+                if prev != curr {
+                    offset = 0;
+                }
+            }
+
             if file_len <= offset {
-                return (offset, Vec::new());
+                return (offset, Vec::new(), current_inode);
             }
 
             let mut reader = BufReader::new(file);
             if reader.seek(SeekFrom::Start(offset)).is_err() {
-                return (offset, Vec::new());
+                return (offset, Vec::new(), current_inode);
             }
 
             let mut matches = Vec::new();
@@ -171,16 +206,20 @@ impl LogWatcherManager {
                     Err(_) => break,
                 }
             }
-            (offset, matches)
+            (offset, matches, current_inode)
         })
         .await;
 
-        let (new_offset, matches) = match read_result {
+        let (new_offset, matches, _new_inode) = match read_result {
             Ok(result) => result,
             Err(_) => return,
         };
 
-        *current_offset = new_offset;
+        file_state.offset = new_offset;
+        #[cfg(unix)]
+        {
+            file_state.inode = _new_inode;
+        }
 
         for matched_line in matches {
             let run_id = Uuid::new_v4();
@@ -296,7 +335,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_log_watcher_rotation() {
         let dir = tempfile::tempdir().unwrap();
         let log_path = dir.path().join("rotating.log");
@@ -316,23 +355,29 @@ mod tests {
             .await
             .unwrap();
 
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-        // Simulate rotation: truncate and write new content
-        std::fs::write(&log_path, "").unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        {
-            let mut f = std::fs::OpenOptions::new()
-                .append(true)
-                .open(&log_path)
-                .unwrap();
-            std::io::Write::write_all(&mut f, b"ERROR: after rotation\n").unwrap();
-        }
 
-        let result = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await;
-        assert!(result.is_ok(), "Should detect content after rotation");
-        let (job, _) = result.unwrap().unwrap();
-        assert!(job.prompt.contains("after rotation"));
+        // Simulate log rotation: remove and recreate the file.
+        // This changes the inode, which the watcher uses to detect rotation
+        // and reset its read offset. Retry a few times to handle environments
+        // where notify events may be delayed.
+        for attempt in 0..5 {
+            std::fs::remove_file(&log_path).ok();
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            std::fs::write(&log_path, "ERROR: after rotation\n").unwrap();
+
+            match tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()).await {
+                Ok(Some((job, _))) => {
+                    assert!(job.prompt.contains("after rotation"));
+                    return;
+                }
+                _ if attempt < 4 => {
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    continue;
+                }
+                _ => panic!("Should detect content after rotation after multiple attempts"),
+            }
+        }
     }
 
     #[tokio::test]

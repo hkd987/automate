@@ -103,7 +103,8 @@ pub async fn run_consumer_with_sender<S: Store>(
 
         // Get credentials for this job
         let mut env = job.env.clone();
-        let creds = store.get_credentials_for_job(&job.automation_name).await;
+        let creds =
+            automate_shared::store::get_credentials_for_job(&store, &job.automation_name).await;
         env.extend(creds);
 
         // Interpolate prompt variables

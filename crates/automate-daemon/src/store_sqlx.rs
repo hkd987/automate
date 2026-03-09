@@ -1,11 +1,9 @@
-use std::collections::HashMap;
 use std::sync::OnceLock;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
 use sqlx::any::{AnyPoolOptions, AnyQueryResult, AnyRow};
 use sqlx::{Acquire, AnyPool, Row};
-use tracing::warn;
 use uuid::Uuid;
 
 use automate_shared::config::AutomationDef;
@@ -88,7 +86,7 @@ impl SqlxStore {
             "CREATE TABLE IF NOT EXISTS credentials (
                 key TEXT PRIMARY KEY,
                 encrypted_value BLOB NOT NULL,
-                nonce BLOB
+                nonce BLOB NOT NULL
             )",
         )
         .execute(&self.pool)
@@ -309,69 +307,6 @@ impl Store for SqlxStore {
             .await?;
         Ok(rows.iter().map(|r: &AnyRow| r.get("key")).collect())
     }
-
-    async fn get_credentials_for_job(&self, automation_name: &str) -> HashMap<String, String> {
-        let mut env = HashMap::new();
-
-        let global_keys = [
-            "ANTHROPIC_API_KEY",
-            "OPENAI_API_KEY",
-            "AWS_ACCESS_KEY_ID",
-            "AWS_SECRET_ACCESS_KEY",
-            "AWS_DEFAULT_REGION",
-        ];
-
-        let all_creds = match self.list_all_credentials().await {
-            Ok(creds) => creds,
-            Err(e) => {
-                warn!(automation = automation_name, error = %e, "Failed to fetch credentials");
-                return env;
-            }
-        };
-
-        // Check automation-specific keys first
-        for key in &global_keys {
-            let prefixed = format!("{}.{}", automation_name, key);
-            if let Some(val) = all_creds.get(&prefixed) {
-                env.insert(key.to_string(), val.clone());
-            }
-        }
-
-        // Fill in any missing from global keys
-        for key in &global_keys {
-            if !env.contains_key(*key) {
-                if let Some(val) = all_creds.get(*key) {
-                    env.insert(key.to_string(), val.clone());
-                }
-            }
-        }
-
-        if env.is_empty() {
-            warn!(automation = automation_name, "No credentials found for job");
-        }
-
-        env
-    }
-}
-
-impl SqlxStore {
-    async fn list_all_credentials(&self) -> Result<HashMap<String, String>> {
-        let rows: Vec<AnyRow> = sqlx::query("SELECT key, encrypted_value, nonce FROM credentials")
-            .fetch_all(&self.pool)
-            .await?;
-        let mut creds = HashMap::new();
-        for row in &rows {
-            let key: String = row.get("key");
-            let encrypted: Vec<u8> = row.get("encrypted_value");
-            let nonce: Vec<u8> = row.get("nonce");
-            if let Ok(decrypted) = decrypt(&encrypted, &nonce) {
-                if let Ok(val) = String::from_utf8(decrypted) {
-                    creds.insert(key, val);
-                }
-            }
-        }
-        Ok(creds)
-    }
 }
 
 #[cfg(test)]
@@ -588,7 +523,7 @@ mod tests {
             .set_credential("ANTHROPIC_API_KEY", "sk-global")
             .await
             .unwrap();
-        let env = store.get_credentials_for_job("my-automation").await;
+        let env = automate_shared::store::get_credentials_for_job(&store, "my-automation").await;
         assert_eq!(env.get("ANTHROPIC_API_KEY"), Some(&"sk-global".to_string()));
     }
 
@@ -603,7 +538,7 @@ mod tests {
             .set_credential("my-auto.ANTHROPIC_API_KEY", "sk-specific")
             .await
             .unwrap();
-        let env = store.get_credentials_for_job("my-auto").await;
+        let env = automate_shared::store::get_credentials_for_job(&store, "my-auto").await;
         assert_eq!(
             env.get("ANTHROPIC_API_KEY"),
             Some(&"sk-specific".to_string())
@@ -613,7 +548,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_credentials_for_job_empty() {
         let store = setup().await;
-        let env = store.get_credentials_for_job("no-creds").await;
+        let env = automate_shared::store::get_credentials_for_job(&store, "no-creds").await;
         assert!(env.is_empty());
     }
 }

@@ -182,34 +182,42 @@ async fn create_automation<S: Store>(
             .into_response();
     }
 
+    // Check for duplicates before inserting to avoid stringly-typed error matching
+    match store.get_automation(&def.name).await {
+        Ok(Some(_)) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(
+                    serde_json::to_value(ErrorResponse::conflict(format!(
+                        "Automation '{}' already exists",
+                        def.name
+                    )))
+                    .unwrap(),
+                ),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::to_value(ErrorResponse::internal(e.to_string())).unwrap()),
+            )
+                .into_response();
+        }
+        Ok(None) => {}
+    }
+
     match store.insert_automation(&def).await {
         Ok(()) => (
             StatusCode::CREATED,
             Json(serde_json::to_value(&def).unwrap()),
         )
             .into_response(),
-        Err(e) => {
-            let msg = e.to_string();
-            if msg.contains("UNIQUE") || msg.contains("duplicate") {
-                (
-                    StatusCode::CONFLICT,
-                    Json(
-                        serde_json::to_value(ErrorResponse::conflict(format!(
-                            "Automation '{}' already exists",
-                            def.name
-                        )))
-                        .unwrap(),
-                    ),
-                )
-                    .into_response()
-            } else {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::to_value(ErrorResponse::internal(msg)).unwrap()),
-                )
-                    .into_response()
-            }
-        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::to_value(ErrorResponse::internal(e.to_string())).unwrap()),
+        )
+            .into_response(),
     }
 }
 

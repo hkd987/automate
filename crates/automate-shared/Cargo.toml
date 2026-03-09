@@ -12,3 +12,4 @@ uuid = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
 anyhow = { workspace = true }
+tracing = { workspace = true }

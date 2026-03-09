@@ -26,7 +26,7 @@ tower-http = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 async-trait = { workspace = true }
 async-stream = { workspace = true }
-tokio-cron-scheduler = "0.11"
+tokio-cron-scheduler = "0.15"
 hmac = "0.12"
 sha2 = "0.10"
 hex = "0.4"
